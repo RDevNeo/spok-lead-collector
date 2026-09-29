@@ -1088,6 +1088,29 @@
     },
   ];
 
+  // TikTok signs these requests from an SDK that arrives WITH the page, a
+  // moment after this script starts on document-idle. Asking before it is there
+  // is answered with an empty body — which is why a sweep started right after a
+  // page load was refused by every pass while the same search answered normally
+  // a few seconds later. Two signals, because neither is promised to last: the
+  // SDK's own global, and something having replaced the page's `fetch`, which is
+  // how it signs. This only ever delays the first request; it never blocks.
+  const TT_SIGNING_WAIT_MS = 15000;
+
+  function ttRequestSigningReady() {
+    if (typeof window.byted_acrawler !== "undefined") return true;
+    try {
+      return !/\[native code\]/.test(Function.prototype.toString.call(window.fetch));
+    } catch {
+      return false;
+    }
+  }
+
+  function ttWaitForRequestSigning() {
+    if (ttRequestSigningReady()) return Promise.resolve(true);
+    return waitFor(() => ttRequestSigningReady() || null, TT_SIGNING_WAIT_MS, 300);
+  }
+
   // "blox fruits" → "bloxfruits", "#Roblox" → "roblox". Null for anything that
   // could not be a hashtag, so the pass is skipped instead of asking TikTok for
   // a tag that cannot exist.
@@ -1100,9 +1123,41 @@
   }
 
   // Whether the page is showing TikTok's verification puzzle. Matched on the
-  // id/class NAME rather than any visible text, which is localized.
+  // id/class NAME rather than any visible text, which is localized, and only on
+  // the puzzle's own CONTAINER: TikTok leaves the challenge's buttons
+  // (`captcha_refresh_button` and friends) in the document between challenges,
+  // so matching any "captcha" name reports a puzzle on a page that is showing
+  // none - which makes an empty API reply blame a puzzle that is not there and
+  // makes every visited profile wait out TT_PUZZLE_WAIT_MS for nothing.
   function ttVerificationShowing() {
-    return Boolean(document.querySelector('[id*="captcha" i], [class*="captcha" i]'));
+    const containers = document.querySelectorAll(
+      '[id*="captcha-verify" i], [class*="captcha-verify" i], [class*="captcha_verify" i]',
+    );
+    for (const container of containers) {
+      const rect = container.getBoundingClientRect();
+      if (rect.width > 0 && rect.height > 0 && getComputedStyle(container).visibility !== "hidden") {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // TikTok sometimes accepts a connection for one of the pages below and then
+  // never answers it. `fetch` has no timeout of its own, so without a bound the
+  // whole sweep stops there - no log line, no progress, nothing to see.
+  const TT_FETCH_TIMEOUT_MS = 15000;
+
+  async function ttFetchPage(url, options) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), TT_FETCH_TIMEOUT_MS);
+    try {
+      return await fetch(url, { ...options, signal: controller.signal });
+    } catch (err) {
+      if (err && err.name === "AbortError") throw new Error("timed out");
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   function ttExtractUniversalData(html) {
@@ -1344,9 +1399,13 @@
       try {
         data = await fetchPage(page);
       } catch (err) {
-        // One paced retry for a status answer; an empty (refused) reply is not
-        // retried, since asking again changes nothing.
-        if (err && !err.ttRefused && !stopRequested) {
+        // One paced retry for a status answer. An empty (refused) reply is
+        // retried too, but only on a pass's FIRST page: TikTok's request
+        // signing arrives with the page, so a Start pressed while it is still
+        // loading is refused once and answered normally a moment later. Later
+        // pages have already proved the signing works, so a refusal there is
+        // real and asking again changes nothing.
+        if (err && (!err.ttRefused || index === 1) && !stopRequested) {
           await sleep(TT_RETRY_DELAY_MS);
           data = await fetchPage(page).catch((retryErr) => {
             err = retryErr;
@@ -1543,7 +1602,7 @@
   // each video's id carries one (ttTimeFromItemId). It answers HTTP 400 with an
   // error page for accounts it will not show — private, banned or removed.
   async function ttFetchEmbed(uniqueId) {
-    const res = await fetch(`${TT_ORIGIN}/embed/@${encodeURIComponent(uniqueId)}`, {
+    const res = await ttFetchPage(`${TT_ORIGIN}/embed/@${encodeURIComponent(uniqueId)}`, {
       credentials: "omit",
     });
     const page = ttExtractEmbedPage(await res.text());
@@ -1634,7 +1693,7 @@
   // no data. Anonymous, like the embed (see the comment above
   // ttExtractEmbedPage).
   async function ttFetchProfile(uniqueId) {
-    const res = await fetch(`${TT_ORIGIN}/@${encodeURIComponent(uniqueId)}`, {
+    const res = await ttFetchPage(`${TT_ORIGIN}/@${encodeURIComponent(uniqueId)}`, {
       credentials: "omit",
     });
     if (!res.ok) throw new Error(`profile HTTP ${res.status}`);
@@ -1673,7 +1732,11 @@
   const TT_SWEEP_STALE_MS = 10 * 60 * 1000;
 
   function ttLoadSweep() {
-    return loadState().ttSweep || null;
+    const sweep = loadState().ttSweep || null;
+    // A sweep saved by an older version carries no `unread` counter, and a
+    // resumed one would then count into `undefined`.
+    if (sweep && sweep.stats && typeof sweep.stats.unread !== "number") sweep.stats.unread = 0;
+    return sweep;
   }
 
   // Never writes after a Stop: the sweep in memory must not resurrect itself.
@@ -1709,6 +1772,18 @@
     return [...ids];
   }
 
+  // TikTok loads a profile's grid lazily. Scrolling the tab list into view is
+  // what a reader does to make it fill, and it reaches the grid's own scroll
+  // container rather than assuming the window is the thing that scrolls.
+  function ttScrollGridIntoView() {
+    const anchor =
+      document.querySelector('[data-e2e="user-post-item-list"]') ||
+      document.querySelector('[data-e2e="user-post-item"]') ||
+      document.querySelector('a[href*="/video/"]');
+    if (anchor) anchor.scrollIntoView({ block: "end" });
+    else window.scrollBy(0, window.innerHeight);
+  }
+
   function ttVideoFromId(uniqueId, id) {
     const time = ttTimeFromItemId(id);
     return {
@@ -1725,7 +1800,7 @@
   // a verification puzzle waits for the operator to solve it — solving it
   // reloads the page, which resumes the sweep right here. Falls back to a
   // background read and then the embed only when the visit itself shows none.
-  async function ttReadVisitedProfile(entry, needDates) {
+  async function ttReadVisitedProfile(entry) {
     const started = Date.now();
     let detail = null;
     let puzzleNoted = false;
@@ -1759,15 +1834,28 @@
       }
     }
 
-    // Dates: the video grid a signed-in visit renders. Skipped when the account
-    // has no videos, or when discovery already settled the gate.
+    // The video grid a signed-in visit renders. It is read for every account
+    // that claims any upload, not only when the freshness gate still wants a
+    // date: it is the only source of the three recent videos the record
+    // carries, so making it conditional left them empty for every account
+    // discovery had already dated - and for EVERY account under "Any time",
+    // which asks for no dates at all. An account whose profile says it has no
+    // videos is the one case with nothing to wait for.
     let ids = [];
-    if (needDates && profile.videos !== 0) {
-      ids =
-        (await waitFor(() => {
+    if (profile.videos !== 0) {
+      const readGrid = () =>
+        waitFor(() => {
           const found = ttVideoIdsOnPage(entry.uniqueId);
           return found.length ? found : null;
-        }, TT_GRID_WAIT_MS, 400)) || [];
+        }, TT_GRID_WAIT_MS, 400);
+
+      ids = (await readGrid()) || [];
+      if (!ids.length) {
+        // TikTok fills the grid lazily, so bring it into view - what a reader
+        // would do - and give it one more go before giving up on the account.
+        ttScrollGridIntoView();
+        ids = (await readGrid()) || [];
+      }
       if (ids.length) {
         // The grid fills in over a moment; read once more after it settles.
         await sleep(800);
@@ -1816,18 +1904,27 @@
     return "visit";
   }
 
-  // Gate and store the account whose profile the tab is on.
+  // Gate and store the account whose profile the tab is on. Returns "retry"
+  // when the page did not give up enough to decide and the account should be
+  // opened once more, "done" when it has been settled one way or the other.
   async function ttHarvestVisited(entry, sweep, known) {
     const label = `@${entry.uniqueId}`;
     const { gapDays, stats } = sweep;
-    const settled = Boolean(entry.latestVideoAt) && daysSince(entry.latestVideoAt) <= gapDays;
 
     let visit;
     try {
-      visit = await ttReadVisitedProfile(entry, gapDays > 0 && !settled);
+      visit = await ttReadVisitedProfile(entry);
     } catch (err) {
+      // A page that would not read is not an answer about the account, so it is
+      // opened once more before the sweep gives up on it.
+      if (!entry.reread && !(err && err.ttNoProfile)) {
+        entry.reread = true;
+        log(`RETRY ${label}: ${err instanceof Error ? err.message : String(err)} - opening it again.`);
+        return "retry";
+      }
+      stats.unread += 1;
       log(`SKIP ${label}: ${err instanceof Error ? err.message : String(err)}`);
-      return;
+      return "done";
     }
     const { profile, uploads } = visit;
     const recentVideos = uploads.videos.length ? uploads.videos : entry.embedVideos || [];
@@ -1836,13 +1933,26 @@
     if (gapDays > 0) {
       const newest = Math.max(entry.latestVideoAt || 0, uploads.newest || 0) || null;
       if (!newest) {
-        stats.dropped += 1;
+        // An account that says it has no uploads really has none - that is the
+        // profile answering. A grid that did not render is the PAGE failing,
+        // which says nothing about the account, so it is opened again rather
+        // than dropped among the dead ones.
+        if (profile.videos === 0) {
+          stats.dropped += 1;
+          log(`DROP ${label}: no public uploads.`);
+          return "done";
+        }
+        if (!entry.reread) {
+          entry.reread = true;
+          log(`RETRY ${label}: no videos showed on the profile - opening it again.`);
+          return "retry";
+        }
+        stats.unread += 1;
         log(
-          profile.videos === 0
-            ? `DROP ${label}: no public uploads.`
-            : `DROP ${label}: could not check uploads (no videos showed on the profile).`,
+          `SKIP ${label}: the video grid would not load, so its last upload ` +
+            "could not be checked. Not counted as dead.",
         );
-        return;
+        return "done";
       }
       uploadAgeDays = daysSince(newest);
       if (uploadAgeDays > gapDays) {
@@ -1851,7 +1961,7 @@
           `DROP ${label}: dead - last upload ${formatUploadAge(uploadAgeDays)} ` +
             `(limit ${gapDays} days).`,
         );
-        return;
+        return "done";
       }
     }
 
@@ -1859,7 +1969,7 @@
     // older one; the id is the first thing that can tell.
     if (!entry.id && known.has(profile.id)) {
       log(`SKIP ${label}: already collected.`);
-      return;
+      return "done";
     }
     known.add(profile.id);
 
@@ -1895,6 +2005,7 @@
       uploadAgeDays === null ? "" : `, last upload ${formatUploadAge(uploadAgeDays)}`;
     log(`OK ${record.name} - ${followers} followers, ${record.links.length} link(s)${freshness}`);
     refreshUI();
+    return "done";
   }
 
   // Drive the saved sweep as far as this page load can take it. Returns
@@ -1928,8 +2039,17 @@
         sweep.current = null;
         persist();
         if (ttOnProfileOf(entry.uniqueId)) {
-          await ttHarvestVisited(entry, sweep, known);
+          if ((await ttHarvestVisited(entry, sweep, known)) === "retry") {
+            // Back to the head of the queue: it is opened again straight away,
+            // while whatever the page was doing is still the freshest guess.
+            sweep.queue.unshift(entry);
+          }
+        } else if (!entry.reread) {
+          entry.reread = true;
+          log(`RETRY @${entry.uniqueId}: the profile would not open - trying it again.`);
+          sweep.queue.unshift(entry);
         } else {
+          sweep.stats.unread += 1;
           log(`SKIP @${entry.uniqueId}: the profile would not open.`);
         }
         persist();
@@ -1938,7 +2058,7 @@
 
       if (sweep.queue.length) {
         const entry = sweep.queue.shift();
-        sweep.stats.considered += 1;
+        if (!entry.reread) sweep.stats.considered += 1;
         if ((await ttPreCheck(entry, sweep)) === "drop") {
           persist();
           continue;
@@ -1952,6 +2072,24 @@
         return "navigating";
       }
 
+      // Whatever results the tab is already showing, read before asking the
+      // API for more — it needs nothing but rendered links, so it works on the
+      // pages where the signed search will not. This lives here rather than at
+      // the start of the sweep so it also covers the results page the sweep
+      // moves itself to below.
+      if (!sweep.screenPassDone && ttOnResultsPage()) {
+        sweep.screenPassDone = true;
+        persist();
+        const via = ttScreenQuery() || sweep.query;
+        const found = await ttScreenPass(known, discoveryAppetite(sweep.target, sweep.stats));
+        for (const entry of found) entry.via = via;
+        sweep.stats.discovered += found.length;
+        sweep.queue.push(...found);
+        if (found.length) log(`Opening ${found.length} profile(s) one by one...`);
+        persist();
+        continue;
+      }
+
       if (sweep.passIndex < TT_DISCOVERY_PASSES.length) {
         const pass = TT_DISCOVERY_PASSES[sweep.passIndex];
         sweep.passIndex += 1;
@@ -1959,6 +2097,7 @@
 
         let fetchPage;
         try {
+          await ttWaitForRequestSigning();
           fetchPage = await pass.open(sweep.query);
         } catch (err) {
           sweep.refused = sweep.refused || Boolean(err && err.ttRefused);
@@ -1991,6 +2130,23 @@
         continue;
       }
 
+      // Every source refused and the tab is on a page that cannot ask. TikTok
+      // signs these requests from code that only SOME of its pages load — its
+      // front page is one that does not, so a sweep started there is refused by
+      // every pass while the very same search answers normally one page over.
+      // Move to the results for the term, which does load it, and run the
+      // passes again from there. Once per sweep: if it refuses there too, the
+      // refusal is real and ttFinishSweep says so.
+      if (sweep.refused && !sweep.movedToResults && !ttOnResultsPage()) {
+        sweep.movedToResults = true;
+        sweep.passIndex = 0;
+        sweep.refused = false;
+        persist();
+        log(`TikTok would not answer from this page - opening its results for "${sweep.query}".`);
+        location.assign(`${TT_ORIGIN}/search?q=${encodeURIComponent(sweep.query)}`);
+        return "navigating";
+      }
+
       break;
     }
 
@@ -2002,6 +2158,15 @@
     const { stats, gapDays, target, query } = sweep;
     if (stats.dropped > 0) {
       log(`Dropped ${stats.dropped} account(s) - no verified upload in the last ${gapDays} days.`);
+    }
+    // Reported apart from the dropped ones on purpose: these were never judged,
+    // so the operator knows there is something left to retry rather than
+    // reading them as accounts TikTok showed to be dead.
+    if (stats.unread > 0) {
+      log(
+        `${stats.unread} account(s) could not be read even after a second try - ` +
+          "run the sweep again to pick them up.",
+      );
     }
     if (stats.discovered === 0) {
       log(
@@ -2034,13 +2199,15 @@
       capturedAt: new Date().toISOString(),
       target: getTargetCount("creators"),
       gapDays: getUploadGapDays(),
-      stats: { considered: 0, kept: 0, dropped: 0, discovered: 0 },
+      stats: { considered: 0, kept: 0, dropped: 0, discovered: 0, unread: 0 },
       passIndex: 0,
       queue: [],
       current: null,
       known: [],
       refused: false,
       embedDown: false,
+      movedToResults: false,
+      screenPassDone: false,
     };
 
     log(
@@ -2053,14 +2220,6 @@
         ? `Dropping any account with no upload in the last ${sweep.gapDays} days.`
         : "No freshness filter - collecting accounts whenever they last posted.",
     );
-
-    if (ttOnResultsPage()) {
-      const via = ttScreenQuery() || query;
-      const found = await ttScreenPass(known, discoveryAppetite(sweep.target, sweep.stats));
-      for (const entry of found) entry.via = via;
-      sweep.stats.discovered += found.length;
-      sweep.queue.push(...found);
-    }
 
     sweep.known = [...known];
     ttSaveSweep(sweep);
