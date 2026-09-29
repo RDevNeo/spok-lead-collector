@@ -1040,18 +1040,12 @@
   // differently and so returns a different set — the same reasoning as
   // YT_DISCOVERY_PASSES. `open` returns the pass's page fetcher, or null when
   // the pass does not apply to the term (a term that is no hashtag).
+  //
+  // The two VIDEO sources run first on purpose: every account they yield comes
+  // dated by the video it was found through, so the freshness gate can often
+  // settle without reading the account's video list. Account search yields
+  // undated accounts, which each cost that read, so it runs last.
   const TT_DISCOVERY_PASSES = [
-    {
-      label: "Accounts",
-      extract: ttSightingsFromUserSearch,
-      open: async (query) => (page) =>
-        ttFetchJson("/api/search/user/full/", {
-          keyword: query,
-          cursor: page.cursor,
-          search_id: page.searchId,
-          from_page: "search",
-        }),
-    },
     {
       label: "Videos",
       extract: ttSightingsFromGeneralSearch,
@@ -1080,6 +1074,19 @@
             from_page: "hashtag",
           });
       },
+    },
+    {
+      label: "Accounts",
+      // Its results carry no upload dates; see ttCollectCreators.
+      undated: true,
+      extract: ttSightingsFromUserSearch,
+      open: async (query) => (page) =>
+        ttFetchJson("/api/search/user/full/", {
+          keyword: query,
+          cursor: page.cursor,
+          search_id: page.searchId,
+          from_page: "search",
+        }),
     },
   ];
 
@@ -1587,22 +1594,36 @@
       // or hashtag results (free). The second keeps the gate working when the
       // list will not answer. With neither, the account is dropped — nothing
       // unverified gets through, the same rule as on YouTube.
+      //
+      // TikTok can refuse the video list while still answering search. Once it
+      // has, the sweep stops asking: every further request would be refused the
+      // same way, and repeating a refused request is exactly the traffic that
+      // earns a verification puzzle.
       let uploadAgeDays = null;
       let recentVideos = [];
       if (gapDays > 0) {
         let newest = entry.latestVideoAt || null;
         let listError = "";
-        if (entry.secUid) {
+        if (!entry.secUid) {
+          listError = "no video seen and no account id to list videos by";
+        } else if (ctx.feedRefused) {
+          listError = "TikTok is refusing video lists and no recent video was seen in search";
+        } else {
           try {
             const feed = await ttFetchRecentUploads(entry);
             recentVideos = feed.videos;
             if (feed.newest && feed.newest > (newest || 0)) newest = feed.newest;
           } catch (err) {
             listError = err instanceof Error ? err.message : String(err);
+            if (err && err.ttRefused) {
+              ctx.feedRefused = true;
+              log(
+                "TikTok is refusing video lists - for the rest of this sweep, freshness " +
+                  "is judged only by videos seen in search results.",
+              );
+            }
           }
           await sleep(TT_FEED_DELAY_MS);
-        } else if (!newest) {
-          listError = "no video seen and no account id to list videos by";
         }
 
         if (!newest) {
@@ -1697,6 +1718,8 @@
       gapDays: getUploadGapDays(),
       stats: { considered: 0, kept: 0, dropped: 0, discovered: 0 },
       known,
+      // Set by ttHarvestAccounts the first time TikTok refuses a video list.
+      feedRefused: false,
     };
     const { target, gapDays, stats } = ctx;
     let refused = false;
@@ -1715,6 +1738,16 @@
     for (const pass of TT_DISCOVERY_PASSES) {
       if (stopRequested) break;
       if (target > 0 && targetReached("creators")) break;
+      // Undated results can only pass the gate through their video lists. With
+      // those refused, every one would be dropped, so the pass is not worth its
+      // requests.
+      if (pass.undated && gapDays > 0 && ctx.feedRefused) {
+        log(
+          `${pass.label}: skipped - its results carry no upload dates, and TikTok ` +
+            "is refusing the video lists that would date them.",
+        );
+        continue;
+      }
 
       let fetchPage;
       try {

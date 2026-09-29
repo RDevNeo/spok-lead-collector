@@ -124,9 +124,9 @@ the same.
 
 | Pass | Source |
 | --- | --- |
-| Accounts | TikTok's account search |
 | Videos | The general (Top) search — the author of every video in it |
 | Hashtag | The term read as a hashtag — `blox fruits` → `#bloxfruits` — skipped if no such tag exists |
+| Accounts | TikTok's account search |
 | On-screen results | Only when the tab is on a TikTok search or hashtag page: scrolls it and reads the result links |
 
 The first three are TikTok's own `/api/…` endpoints, which only answer requests carrying TikTok's
@@ -141,6 +141,13 @@ videos for the CRM podium (`recent_videos`). Failing that, the newest video the 
 from that account counts: a TikTok video id carries its creation time in its top 32 bits, so even a
 bare `/video/<id>` link dates an upload without a request or any localized "2d ago" text. An account
 with neither is dropped as `could not check uploads`.
+
+The video-list endpoint is stricter than search, and TikTok can refuse it while search still works.
+The first refusal ends video-list requests for the rest of the sweep — repeating a refused request
+changes nothing and invites a verification puzzle — and freshness is then judged only by the videos
+seen in search. That is why the two video sources run first (their accounts arrive dated) and why
+**Accounts**, whose results carry no dates, is skipped once video lists are refused. On *Any time* no
+date is needed, so every pass runs.
 
 **Profiles** come from the server-rendered `/@handle` page, which embeds the whole profile as JSON
 (`__UNIVERSAL_DATA_FOR_REHYDRATION__`) and needs no signature.
