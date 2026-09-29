@@ -136,21 +136,23 @@ replies with an **empty** body, not an error — the log says so, and the fix is
 `https://www.tiktok.com/search/video?q=<term>` and press Start again: the on-screen pass then reads
 the results you can see, which needs no signature.
 
-**Freshness** is dated two ways. The account's video list gives the newest upload and the three newest
-videos for the CRM podium (`recent_videos`). Failing that, the newest video the sweep already *saw*
-from that account counts: a TikTok video id carries its creation time in its top 32 bits, so even a
-bare `/video/<id>` link dates an upload without a request or any localized "2d ago" text. An account
-with neither is dropped as `could not check uploads`.
+**Freshness** is read from the account's **creator embed** (`/embed/@handle`) — TikTok's public embed
+widget, whose HTML lists the account's newest videos. The embed shows no dates, but a TikTok video id
+carries its creation time in its top 32 bits, so each id dates its upload without any localized "2d
+ago" text. The same read supplies the three newest videos for the CRM podium (`recent_videos`). A
+video the sweep already saw in search counts too. An account neither source can date is dropped as
+`could not check uploads`; a private account has no embed and is named as such.
 
-The video-list endpoint is stricter than search, and TikTok can refuse it while search still works.
-The first refusal ends video-list requests for the rest of the sweep — repeating a refused request
-changes nothing and invites a verification puzzle — and freshness is then judged only by the videos
-seen in search. That is why the two video sources run first (their accounts arrive dated) and why
-**Accounts**, whose results carry no dates, is skipped once video lists are refused. On *Any time* no
-date is needed, so every pass runs.
+The video-list API (`/api/post/item_list/`) is not used: it answers with an empty body even to
+TikTok's own app when that is not signed in, which in live use meant nearly every account went
+unchecked.
 
 **Profiles** come from the server-rendered `/@handle` page, which embeds the whole profile as JSON
-(`__UNIVERSAL_DATA_FOR_REHYDRATION__`) and needs no signature.
+(`__UNIVERSAL_DATA_FOR_REHYDRATION__`) and needs no signature. Both the profile and the embed are
+fetched **without your cookies**: signed in, TikTok served most profile pages without their data,
+while the anonymous pages read every time in testing. If a profile page still cannot be read, the
+embed's shorter profile (no bio link or video count) stands in and the log says `NOTE … using its
+embed instead`, so a live account is never lost to it.
 
 | Field | Notes |
 | --- | --- |

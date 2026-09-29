@@ -1003,8 +1003,8 @@
   //     scope holds the whole profile: id, bio, bio link, follower / like / video
   //     counts. A plain same-origin fetch reads it — verified even logged out.
   //
-  //   • Search results, hashtag feeds and an account's video list are in NO
-  //     HTML: the app asks `/api/...` for them. Those endpoints demand request
+  //   • Search results and hashtag feeds are in NO HTML: the app asks
+  //     `/api/...` for them. Those endpoints demand request
   //     signatures (`X-Bogus`, `X-Gnarly`, `msToken`) and answer an unsigned
   //     request with HTTP 200 and an EMPTY body rather than an error. TikTok's
   //     own security SDK wraps the page's `fetch`/`XMLHttpRequest` and signs the
@@ -1025,6 +1025,10 @@
   const TT_ENRICH_DELAY_MS = 800;
   const TT_FEED_DELAY_MS = 400;
   const TT_SCROLL_DELAY_MS = 1800;
+  // Pause before the single retry of a search page TikTok answered with a
+  // non-zero status (203 in live use, after several sweeps back to back) — its
+  // "slow down", which a pause usually clears.
+  const TT_RETRY_DELAY_MS = 5000;
 
   // Safety stop only, like YT_MAX_PAGES.
   const TT_MAX_PAGES = 60;
@@ -1032,19 +1036,15 @@
   // pages with nobody new really is the end of the vein.
   const TT_DRY_PAGE_LIMIT = 3;
   const TT_SCROLL_DRY_LIMIT = 4;
-  // Enough of an account's newest videos that a few pinned (old) ones at the top
-  // cannot crowd the real newest upload out of the list.
-  const TT_FEED_COUNT = 16;
 
   // Discovery passes, run in order until the target is met. Each ranks
   // differently and so returns a different set — the same reasoning as
   // YT_DISCOVERY_PASSES. `open` returns the pass's page fetcher, or null when
   // the pass does not apply to the term (a term that is no hashtag).
   //
-  // The two VIDEO sources run first on purpose: every account they yield comes
-  // dated by the video it was found through, so the freshness gate can often
-  // settle without reading the account's video list. Account search yields
-  // undated accounts, which each cost that read, so it runs last.
+  // The two VIDEO sources run first: they surface accounts through what was
+  // posted recently, so more of what they find clears the freshness gate than
+  // accounts matched by name.
   const TT_DISCOVERY_PASSES = [
     {
       label: "Videos",
@@ -1077,8 +1077,6 @@
     },
     {
       label: "Accounts",
-      // Its results carry no upload dates; see ttCollectCreators.
-      undated: true,
       extract: ttSightingsFromUserSearch,
       open: async (query) => (page) =>
         ttFetchJson("/api/search/user/full/", {
@@ -1341,9 +1339,20 @@
       try {
         data = await fetchPage(page);
       } catch (err) {
-        refused = Boolean(err && err.ttRefused);
-        log(`${label} page ${index} failed: ${err instanceof Error ? err.message : String(err)}`);
-        break;
+        // One paced retry for a status answer; an empty (refused) reply is not
+        // retried, since asking again changes nothing.
+        if (err && !err.ttRefused && !stopRequested) {
+          await sleep(TT_RETRY_DELAY_MS);
+          data = await fetchPage(page).catch((retryErr) => {
+            err = retryErr;
+            return null;
+          });
+        }
+        if (!data) {
+          refused = Boolean(err && err.ttRefused);
+          log(`${label} page ${index} failed: ${err instanceof Error ? err.message : String(err)}`);
+          break;
+        }
       }
 
       let fresh = 0;
@@ -1474,66 +1483,132 @@
   }
 
   // --- Freshness and profile -------------------------------------------------
+  //
+  // Both reads are server-rendered pages, fetched WITHOUT the operator's
+  // cookies:
+  //
+  //   • `/embed/@handle` is TikTok's public creator embed — the widget other
+  //     sites put on their pages. Its HTML carries the account's newest videos
+  //     (`__FRONTITY_CONNECT_STATE__` → `source.data["/embed/@handle"]`), which
+  //     is what the freshness gate and the podium need.
+  //   • `/@handle` carries the full profile (see the section comment above).
+  //
+  // Anonymous on purpose. The video-list API (`/api/post/item_list/`) answers
+  // with an empty body even to TikTok's own app when it is not signed in, and
+  // in live use a signed-in fetch of profile pages came back without profile
+  // data for most accounts. The anonymous pages are the shape verified to
+  // answer, account after account, and a sweep then never acts as the
+  // operator's account.
 
-  // An account's newest videos from its video list: the newest time for the
-  // gate, and the top YT_RECENT_VIDEO_LIMIT for the CRM's "Most Recent" podium —
-  // the same `{ newest, videos }` contract as ytFetchRecentUploads. Pinned
-  // videos come first in this list whatever their age, hence taking the MAX
-  // time and sorting rather than trusting the order.
-  async function ttFetchRecentUploads(entry) {
-    const data = await ttFetchJson("/api/post/item_list/", {
-      secUid: entry.secUid,
-      count: TT_FEED_COUNT,
-      cursor: 0,
-    });
-
-    let newest = 0;
-    const videos = [];
-    for (const item of data.itemList || []) {
-      if (!item || !item.id) continue;
-      const time = ttItemTime(item);
-      if (time && time > newest) newest = time;
-      videos.push({
-        video_id: String(item.id),
-        title: String(item.desc || "").trim() || null,
-        url: `${TT_ORIGIN}/@${entry.uniqueId}/video/${item.id}`,
-        thumbnail_url: item.video?.cover || item.video?.originCover || null,
-        published_at: time ? new Date(time).toISOString() : null,
-        view_count: ttCount(item.statsV2?.playCount, item.stats?.playCount),
-      });
+  function ttExtractEmbedPage(html) {
+    const match = html.match(
+      /<script[^>]+id="__FRONTITY_CONNECT_STATE__"[^>]*>([\s\S]*?)<\/script>/,
+    );
+    if (!match) return null;
+    try {
+      const data = (JSON.parse(match[1]).source || {}).data || {};
+      const key = Object.keys(data).find((name) => name.startsWith("/embed/@"));
+      return key ? data[key] : null;
+    } catch {
+      return null;
     }
+  }
 
+  // Newest upload time plus the podium, from videos in any order — the same
+  // `{ newest, videos }` contract as ytFetchRecentUploads.
+  function ttNewestUploads(videos) {
+    let newest = 0;
+    for (const video of videos) {
+      const time = video.published_at ? Date.parse(video.published_at) : 0;
+      if (time > newest) newest = time;
+    }
     videos.sort((a, b) => {
       const left = a.published_at ? Date.parse(a.published_at) : 0;
       const right = b.published_at ? Date.parse(b.published_at) : 0;
       return right - left;
     });
-
     return {
       newest: newest > 0 ? newest : null,
       videos: videos.slice(0, YT_RECENT_VIDEO_LIMIT),
     };
   }
 
+  // Read an account's creator embed: its newest videos (`uploads`) and the
+  // short profile the embed shows (`user`). The embed lists no upload dates;
+  // each video's id carries one (ttTimeFromItemId). It answers HTTP 400 with an
+  // error page for accounts it will not show — private, banned or removed.
+  async function ttFetchEmbed(uniqueId) {
+    const res = await fetch(`${TT_ORIGIN}/embed/@${encodeURIComponent(uniqueId)}`, {
+      credentials: "omit",
+    });
+    const page = ttExtractEmbedPage(await res.text());
+    if (!page) throw new Error(`could not read the creator embed (HTTP ${res.status})`);
+    if (page.isError) throw new Error("account is private or unavailable");
+
+    const videos = [];
+    for (const item of page.videoList || []) {
+      if (!item || !item.id || item.privateItem) continue;
+      const time = ttTimeFromItemId(item.id);
+      videos.push({
+        video_id: String(item.id),
+        title: String(item.desc || "").trim() || null,
+        url: `${TT_ORIGIN}/@${uniqueId}/video/${item.id}`,
+        thumbnail_url: item.originCoverUrl || item.coverUrl || null,
+        published_at: time ? new Date(time).toISOString() : null,
+        view_count: ttCount(item.playCount),
+      });
+    }
+    return { user: page.userInfo || null, uploads: ttNewestUploads(videos) };
+  }
+
+  // The embed's short profile in ttFetchProfile's shape — the fallback when the
+  // profile page itself cannot be read, so a live account found by the sweep is
+  // still collected. It has no bio link and no video count, and its like count
+  // overflows a 32-bit integer on big accounts, so likes are only kept when
+  // they are plausible.
+  function ttProfileFromEmbed(user) {
+    if (!user || !user.id || !user.uniqueId) return null;
+    const likes = ttCount(user.heartCount);
+    return {
+      id: String(user.id),
+      uniqueId: user.uniqueId,
+      name: user.nickname || null,
+      avatarUrl: user.avatarThumbUrl || null,
+      followers: ttCount(user.followerCount),
+      likes: likes !== null && likes >= 0 ? likes : null,
+      videos: null,
+      description: String(user.signature || "").trim() || null,
+      country: null,
+      links: [],
+    };
+  }
+
   // Read one profile from its server-rendered page. Needs no signature, which is
   // why every record goes through here even when discovery already had a name.
+  // Anonymous, like the embed — see the comment above ttExtractEmbedPage.
   async function ttFetchProfile(uniqueId) {
     const res = await fetch(`${TT_ORIGIN}/@${encodeURIComponent(uniqueId)}`, {
-      credentials: "include",
+      credentials: "omit",
     });
     if (!res.ok) throw new Error(`profile HTTP ${res.status}`);
     const scope = ttExtractUniversalData(await res.text());
     const detail = scope && scope["webapp.user-detail"];
     if (!detail) {
       throw new Error(
-        ttVerificationShowing()
-          ? "TikTok is showing a verification puzzle"
-          : "could not read profile data",
+        scope
+          ? `no profile in the page (sections: ${Object.keys(scope).join(", ") || "none"})`
+          : "no profile data in the page",
       );
     }
-    // 10221 is a banned or missing account; anything non-zero means no profile.
-    if (Number(detail.statusCode)) {
-      throw new Error(`profile unavailable (status ${detail.statusCode})`);
+    // 10222 is a private account, 10221 a banned or missing one; anything
+    // non-zero means there is no profile to read.
+    const status = Number(detail.statusCode);
+    if (status) {
+      const err = new Error(
+        status === 10222 ? "account is private" : `profile unavailable (status ${status})`,
+      );
+      err.ttNoProfile = true;
+      throw err;
     }
 
     const info = detail.userInfo || {};
@@ -1589,48 +1664,30 @@
       stats.considered += 1;
 
       // Freshness gate, ahead of the profile read. Two sources can date the
-      // newest upload: the account's video list (signed API; it also fills the
-      // podium) and the newest video this sweep already SAW from them in video
-      // or hashtag results (free). The second keeps the gate working when the
-      // list will not answer. With neither, the account is dropped — nothing
+      // newest upload: the account's creator embed (it also fills the podium)
+      // and the newest video this sweep already SAW from them in video or
+      // hashtag results. With neither, the account is dropped — nothing
       // unverified gets through, the same rule as on YouTube.
-      //
-      // TikTok can refuse the video list while still answering search. Once it
-      // has, the sweep stops asking: every further request would be refused the
-      // same way, and repeating a refused request is exactly the traffic that
-      // earns a verification puzzle.
       let uploadAgeDays = null;
       let recentVideos = [];
+      let embed = null;
       if (gapDays > 0) {
-        let newest = entry.latestVideoAt || null;
-        let listError = "";
-        if (!entry.secUid) {
-          listError = "no video seen and no account id to list videos by";
-        } else if (ctx.feedRefused) {
-          listError = "TikTok is refusing video lists and no recent video was seen in search";
-        } else {
-          try {
-            const feed = await ttFetchRecentUploads(entry);
-            recentVideos = feed.videos;
-            if (feed.newest && feed.newest > (newest || 0)) newest = feed.newest;
-          } catch (err) {
-            listError = err instanceof Error ? err.message : String(err);
-            if (err && err.ttRefused) {
-              ctx.feedRefused = true;
-              log(
-                "TikTok is refusing video lists - for the rest of this sweep, freshness " +
-                  "is judged only by videos seen in search results.",
-              );
-            }
-          }
-          await sleep(TT_FEED_DELAY_MS);
+        let embedError = "";
+        try {
+          embed = await ttFetchEmbed(entry.uniqueId);
+          recentVideos = embed.uploads.videos;
+        } catch (err) {
+          embedError = err instanceof Error ? err.message : String(err);
         }
+        await sleep(TT_FEED_DELAY_MS);
 
+        const newest =
+          Math.max(entry.latestVideoAt || 0, (embed && embed.uploads.newest) || 0) || null;
         if (!newest) {
           stats.dropped += 1;
           log(
-            listError
-              ? `DROP ${label}: could not check uploads (${listError}).`
+            embedError
+              ? `DROP ${label}: could not check uploads (${embedError}).`
               : `DROP ${label}: no public uploads.`,
           );
           continue;
@@ -1648,7 +1705,19 @@
       }
 
       try {
-        const profile = await ttFetchProfile(entry.uniqueId);
+        // A live account is not given up because its profile page would not
+        // read: the embed's shorter profile stands in, and the log says so.
+        let profile;
+        try {
+          profile = await ttFetchProfile(entry.uniqueId);
+        } catch (err) {
+          if (err && err.ttNoProfile) throw err;
+          if (!embed) embed = await ttFetchEmbed(entry.uniqueId).catch(() => null);
+          profile = embed && ttProfileFromEmbed(embed.user);
+          if (!profile) throw err;
+          const reason = err instanceof Error ? err.message : String(err);
+          log(`NOTE ${label}: profile page unreadable (${reason}) - using its embed instead.`);
+        }
         // The on-screen pass only knew a handle, so this is the first chance to
         // see the id — and to notice a creator collected under an older handle.
         if (!entry.id && known.has(profile.id)) {
@@ -1718,8 +1787,6 @@
       gapDays: getUploadGapDays(),
       stats: { considered: 0, kept: 0, dropped: 0, discovered: 0 },
       known,
-      // Set by ttHarvestAccounts the first time TikTok refuses a video list.
-      feedRefused: false,
     };
     const { target, gapDays, stats } = ctx;
     let refused = false;
@@ -1738,17 +1805,6 @@
     for (const pass of TT_DISCOVERY_PASSES) {
       if (stopRequested) break;
       if (target > 0 && targetReached("creators")) break;
-      // Undated results can only pass the gate through their video lists. With
-      // those refused, every one would be dropped, so the pass is not worth its
-      // requests.
-      if (pass.undated && gapDays > 0 && ctx.feedRefused) {
-        log(
-          `${pass.label}: skipped - its results carry no upload dates, and TikTok ` +
-            "is refusing the video lists that would date them.",
-        );
-        continue;
-      }
-
       let fetchPage;
       try {
         fetchPage = await pass.open(query);
