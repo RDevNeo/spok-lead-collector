@@ -1122,12 +1122,17 @@
   // the API expects. Read from the tab's own rehydration blob; an empty object
   // when it is gone, which only costs the optional parameters.
   function ttPageContext() {
+    const scope = ttDocumentScope();
+    return (scope && scope["webapp.app-context"]) || {};
+  }
+
+  // The tab's own rehydration blob — on a visited profile, that profile.
+  function ttDocumentScope() {
     const script = document.getElementById("__UNIVERSAL_DATA_FOR_REHYDRATION__");
     try {
-      const data = JSON.parse(script ? script.textContent : "");
-      return (data.__DEFAULT_SCOPE__ && data.__DEFAULT_SCOPE__["webapp.app-context"]) || {};
+      return JSON.parse(script ? script.textContent : "").__DEFAULT_SCOPE__ || null;
     } catch {
-      return {};
+      return null;
     }
   }
 
@@ -1583,25 +1588,10 @@
     };
   }
 
-  // Read one profile from its server-rendered page. Needs no signature, which is
-  // why every record goes through here even when discovery already had a name.
-  // Anonymous, like the embed — see the comment above ttExtractEmbedPage.
-  async function ttFetchProfile(uniqueId) {
-    const res = await fetch(`${TT_ORIGIN}/@${encodeURIComponent(uniqueId)}`, {
-      credentials: "omit",
-    });
-    if (!res.ok) throw new Error(`profile HTTP ${res.status}`);
-    const scope = ttExtractUniversalData(await res.text());
-    const detail = scope && scope["webapp.user-detail"];
-    if (!detail) {
-      throw new Error(
-        scope
-          ? `no profile in the page (sections: ${Object.keys(scope).join(", ") || "none"})`
-          : "no profile data in the page",
-      );
-    }
-    // 10222 is a private account, 10221 a banned or missing one; anything
-    // non-zero means there is no profile to read.
+  // The profile in a `webapp.user-detail` scope — from a visited page or a
+  // fetched one. 10222 is a private account, 10221 a banned or missing one;
+  // any non-zero status means there is no profile to read.
+  function ttProfileFromDetail(detail) {
     const status = Number(detail.statusCode);
     if (status) {
       const err = new Error(
@@ -1640,227 +1630,387 @@
     };
   }
 
+  // Background read of a profile page — the fallback for a visit that showed
+  // no data. Anonymous, like the embed (see the comment above
+  // ttExtractEmbedPage).
+  async function ttFetchProfile(uniqueId) {
+    const res = await fetch(`${TT_ORIGIN}/@${encodeURIComponent(uniqueId)}`, {
+      credentials: "omit",
+    });
+    if (!res.ok) throw new Error(`profile HTTP ${res.status}`);
+    const scope = ttExtractUniversalData(await res.text());
+    const detail = scope && scope["webapp.user-detail"];
+    if (!detail) throw new Error("no profile data in the page");
+    return ttProfileFromDetail(detail);
+  }
+
   // --- TikTok sweep ----------------------------------------------------------
+  //
+  // Each account is read by VISITING its profile in the operator's tab, not by
+  // fetching the page in the background. In live use TikTok answered
+  // background fetches of profile and embed pages with 503s and with pages
+  // stripped of their data — its treatment of traffic that is not a page visit
+  // — while the very same profiles opened normally. A visit gets the page the
+  // operator would see: the full profile JSON in the document and, signed in,
+  // the video grid whose links date the uploads (ttTimeFromItemId).
+  //
+  // A visit reloads the page and this script with it, so the sweep lives in
+  // saved state (`ttSweep`) and resumes on every load: read the profile the tab
+  // was sent to, then open the next queued account, or run the next discovery
+  // pass once the queue is empty. The creator embed is still tried first as a
+  // cheap check that can drop a dead account without a visit; the first time it
+  // fails, it is not asked again for the rest of the sweep.
 
-  // Gate, read and store one batch of discovered accounts. Mirrors
-  // harvestChannels, including stopping the moment the target is met.
-  async function ttHarvestAccounts(entries, ctx) {
-    const { query, capturedAt, platform, target, gapDays, stats, known } = ctx;
+  // How long a visited profile has to show its data before the account is
+  // given up, and how long its video grid gets to appear.
+  const TT_VISIT_TIMEOUT_MS = 20000;
+  const TT_GRID_WAIT_MS = 8000;
+  // How long the sweep waits on a verification puzzle for the operator to
+  // solve it.
+  const TT_PUZZLE_WAIT_MS = 180000;
+  // A saved sweep older than this is abandoned rather than resumed: the tab was
+  // closed or left, and picking it up hours later would surprise the operator.
+  const TT_SWEEP_STALE_MS = 10 * 60 * 1000;
 
-    log(
-      gapDays > 0
-        ? `Checking uploads on ${entries.length} account(s), then reading the live ones...`
-        : `Reading ${entries.length} profile(s)...`,
-    );
+  function ttLoadSweep() {
+    return loadState().ttSweep || null;
+  }
 
-    for (const entry of entries) {
-      if (stopRequested) break;
-      if (target > 0 && targetReached("creators")) {
-        log(`Target of ${target} creator(s) reached.`);
+  // Never writes after a Stop: the sweep in memory must not resurrect itself.
+  function ttSaveSweep(sweep) {
+    const state = loadState();
+    if (!state.running) return;
+    sweep.updatedAt = Date.now();
+    state.ttSweep = sweep;
+    saveState(state);
+  }
+
+  function ttClearSweep() {
+    const state = loadState();
+    state.ttSweep = null;
+    saveState(state);
+  }
+
+  function ttOnProfileOf(uniqueId) {
+    const match = location.pathname.match(/^\/@([^/?#]+)\/?$/);
+    return Boolean(match && decodeURIComponent(match[1]).toLowerCase() === uniqueId.toLowerCase());
+  }
+
+  // Ids of this account's videos linked on the page. Only links to THIS handle
+  // count: a profile also shows other accounts' videos.
+  function ttVideoIdsOnPage(uniqueId) {
+    const handle = uniqueId.toLowerCase();
+    const ids = new Set();
+    for (const anchor of document.querySelectorAll('a[href*="/video/"]')) {
+      if (anchor.closest("#dic-panel")) continue;
+      const match = (anchor.getAttribute("href") || "").match(/\/@([\w.]+)\/video\/(\d+)/);
+      if (match && match[1].toLowerCase() === handle) ids.add(match[2]);
+    }
+    return [...ids];
+  }
+
+  function ttVideoFromId(uniqueId, id) {
+    const time = ttTimeFromItemId(id);
+    return {
+      video_id: String(id),
+      title: null,
+      url: `${TT_ORIGIN}/@${uniqueId}/video/${id}`,
+      thumbnail_url: null,
+      published_at: time ? new Date(time).toISOString() : null,
+      view_count: null,
+    };
+  }
+
+  // Read the profile the tab is on. Waits for the page's profile data, and on
+  // a verification puzzle waits for the operator to solve it — solving it
+  // reloads the page, which resumes the sweep right here. Falls back to a
+  // background read and then the embed only when the visit itself shows none.
+  async function ttReadVisitedProfile(entry, needDates) {
+    const started = Date.now();
+    let detail = null;
+    let puzzleNoted = false;
+    while (!stopRequested && Date.now() - started < TT_PUZZLE_WAIT_MS) {
+      const scope = ttDocumentScope();
+      detail = scope && scope["webapp.user-detail"];
+      if (detail) break;
+      if (ttVerificationShowing()) {
+        if (!puzzleNoted) {
+          puzzleNoted = true;
+          log("TikTok is showing a verification puzzle - solve it and the sweep carries on.");
+        }
+      } else if (Date.now() - started > TT_VISIT_TIMEOUT_MS) {
+        break;
+      }
+      await sleep(500);
+    }
+
+    let profile;
+    if (detail) {
+      profile = ttProfileFromDetail(detail);
+    } else {
+      try {
+        profile = await ttFetchProfile(entry.uniqueId);
+      } catch (err) {
+        if (err && err.ttNoProfile) throw err;
+        const embed = await ttFetchEmbed(entry.uniqueId).catch(() => null);
+        profile = embed && ttProfileFromEmbed(embed.user);
+        if (!profile) throw new Error("the profile page showed no profile data");
+        log(`NOTE @${entry.uniqueId}: profile page had no data - using its embed instead.`);
+      }
+    }
+
+    // Dates: the video grid a signed-in visit renders. Skipped when the account
+    // has no videos, or when discovery already settled the gate.
+    let ids = [];
+    if (needDates && profile.videos !== 0) {
+      ids =
+        (await waitFor(() => {
+          const found = ttVideoIdsOnPage(entry.uniqueId);
+          return found.length ? found : null;
+        }, TT_GRID_WAIT_MS, 400)) || [];
+      if (ids.length) {
+        // The grid fills in over a moment; read once more after it settles.
+        await sleep(800);
+        ids = [...new Set([...ids, ...ttVideoIdsOnPage(entry.uniqueId)])];
+      }
+    }
+    const videos = ids.map((id) => ttVideoFromId(profile.uniqueId, id));
+    return { profile, uploads: ttNewestUploads(videos) };
+  }
+
+  // Cheap check before a visit: the creator embed. Returns "drop" for an
+  // account it shows to be dead or private, "visit" otherwise. The first
+  // failure that is not about the account itself marks embeds down for the
+  // sweep, so a blocked embed costs one request, not one per account.
+  async function ttPreCheck(entry, sweep) {
+    if (sweep.gapDays <= 0 || sweep.embedDown) return "visit";
+    const label = `@${entry.uniqueId}`;
+    let embed;
+    try {
+      embed = await ttFetchEmbed(entry.uniqueId);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (/private or unavailable/.test(message)) {
+        sweep.stats.dropped += 1;
+        log(`DROP ${label}: ${message}.`);
+        return "drop";
+      }
+      sweep.embedDown = true;
+      log(`Creator embeds are not answering (${message}) - checking each account on its profile.`);
+      return "visit";
+    } finally {
+      await sleep(TT_FEED_DELAY_MS);
+    }
+
+    entry.embedVideos = embed.uploads.videos;
+    const newest = Math.max(entry.latestVideoAt || 0, embed.uploads.newest || 0) || null;
+    if (newest) entry.latestVideoAt = newest;
+    if (newest && daysSince(newest) > sweep.gapDays) {
+      sweep.stats.dropped += 1;
+      log(
+        `DROP ${label}: dead - last upload ${formatUploadAge(daysSince(newest))} ` +
+          `(limit ${sweep.gapDays} days).`,
+      );
+      return "drop";
+    }
+    return "visit";
+  }
+
+  // Gate and store the account whose profile the tab is on.
+  async function ttHarvestVisited(entry, sweep, known) {
+    const label = `@${entry.uniqueId}`;
+    const { gapDays, stats } = sweep;
+    const settled = Boolean(entry.latestVideoAt) && daysSince(entry.latestVideoAt) <= gapDays;
+
+    let visit;
+    try {
+      visit = await ttReadVisitedProfile(entry, gapDays > 0 && !settled);
+    } catch (err) {
+      log(`SKIP ${label}: ${err instanceof Error ? err.message : String(err)}`);
+      return;
+    }
+    const { profile, uploads } = visit;
+    const recentVideos = uploads.videos.length ? uploads.videos : entry.embedVideos || [];
+
+    let uploadAgeDays = null;
+    if (gapDays > 0) {
+      const newest = Math.max(entry.latestVideoAt || 0, uploads.newest || 0) || null;
+      if (!newest) {
+        stats.dropped += 1;
+        log(
+          profile.videos === 0
+            ? `DROP ${label}: no public uploads.`
+            : `DROP ${label}: could not check uploads (no videos showed on the profile).`,
+        );
+        return;
+      }
+      uploadAgeDays = daysSince(newest);
+      if (uploadAgeDays > gapDays) {
+        stats.dropped += 1;
+        log(
+          `DROP ${label}: dead - last upload ${formatUploadAge(uploadAgeDays)} ` +
+            `(limit ${gapDays} days).`,
+        );
+        return;
+      }
+    }
+
+    // A discovered handle may belong to a creator already collected under an
+    // older one; the id is the first thing that can tell.
+    if (!entry.id && known.has(profile.id)) {
+      log(`SKIP ${label}: already collected.`);
+      return;
+    }
+    known.add(profile.id);
+
+    const record = {
+      platform: "tiktok",
+      platform_id: profile.id,
+      name: profile.name || entry.name || profile.uniqueId,
+      handle: `@${profile.uniqueId}`,
+      profile_url: `${TT_ORIGIN}/@${profile.uniqueId}`,
+      avatar_url: profile.avatarUrl || entry.avatarUrl,
+      subscriber_count: profile.followers ?? entry.followers ?? null,
+      video_count: profile.videos,
+      // TikTok publishes no lifetime view total. Likes received is the nearest
+      // audience signal it does publish, so it travels in its own field
+      // instead of being passed off as views.
+      view_count: null,
+      like_count: profile.likes,
+      description: profile.description,
+      links: profile.links,
+      country: profile.country,
+      discovered_via: entry.via || sweep.query,
+      captured_at: sweep.capturedAt,
+      // Omitted rather than empty when no videos were read — same reason as on
+      // YouTube: the CRM reads an empty array as "no uploads".
+      ...(recentVideos.length ? { recent_videos: recentVideos } : {}),
+    };
+    const state = loadState();
+    state.creators = (state.creators || []).concat([record]);
+    saveState(state);
+    stats.kept += 1;
+    const followers = record.subscriber_count === null ? "hidden" : record.subscriber_count;
+    const freshness =
+      uploadAgeDays === null ? "" : `, last upload ${formatUploadAge(uploadAgeDays)}`;
+    log(`OK ${record.name} - ${followers} followers, ${record.links.length} link(s)${freshness}`);
+    refreshUI();
+  }
+
+  // Drive the saved sweep as far as this page load can take it. Returns
+  // "navigating" when it has sent the tab to the next profile (the next load
+  // picks up from there) and "done" when the sweep has ended.
+  async function ttContinueSweep() {
+    const sweep = ttLoadSweep();
+    if (!sweep) return "done";
+    const known = new Set(sweep.known || []);
+    const persist = () => {
+      sweep.known = [...known];
+      ttSaveSweep(sweep);
+    };
+
+    while (!stopRequested && loadState().running) {
+      if (sweep.target > 0 && targetReached("creators")) {
+        log(`Target of ${sweep.target} creator(s) reached.`);
         break;
       }
 
-      const label = `@${entry.uniqueId}`;
-      stats.considered += 1;
-
-      // Freshness gate, ahead of the profile read. Two sources can date the
-      // newest upload: the account's creator embed (it also fills the podium)
-      // and the newest video this sweep already SAW from them in video or
-      // hashtag results. With neither, the account is dropped — nothing
-      // unverified gets through, the same rule as on YouTube.
-      let uploadAgeDays = null;
-      let recentVideos = [];
-      let embed = null;
-      if (gapDays > 0) {
-        let embedError = "";
-        try {
-          embed = await ttFetchEmbed(entry.uniqueId);
-          recentVideos = embed.uploads.videos;
-        } catch (err) {
-          embedError = err instanceof Error ? err.message : String(err);
+      // The account the tab was sent to. One retry if the visit landed
+      // somewhere else (a redirect, or the operator clicking away).
+      if (sweep.current) {
+        const entry = sweep.current;
+        if (!ttOnProfileOf(entry.uniqueId) && (entry.visits || 0) < 2) {
+          entry.visits = (entry.visits || 0) + 1;
+          persist();
+          location.assign(`${TT_ORIGIN}/@${encodeURIComponent(entry.uniqueId)}`);
+          return "navigating";
         }
-        await sleep(TT_FEED_DELAY_MS);
-
-        const newest =
-          Math.max(entry.latestVideoAt || 0, (embed && embed.uploads.newest) || 0) || null;
-        if (!newest) {
-          stats.dropped += 1;
-          log(
-            embedError
-              ? `DROP ${label}: could not check uploads (${embedError}).`
-              : `DROP ${label}: no public uploads.`,
-          );
-          continue;
+        sweep.current = null;
+        persist();
+        if (ttOnProfileOf(entry.uniqueId)) {
+          await ttHarvestVisited(entry, sweep, known);
+        } else {
+          log(`SKIP @${entry.uniqueId}: the profile would not open.`);
         }
-
-        uploadAgeDays = daysSince(newest);
-        if (uploadAgeDays > gapDays) {
-          stats.dropped += 1;
-          log(
-            `DROP ${label}: dead - last upload ${formatUploadAge(uploadAgeDays)} ` +
-              `(limit ${gapDays} days).`,
-          );
-          continue;
-        }
+        persist();
+        continue;
       }
 
-      try {
-        // A live account is not given up because its profile page would not
-        // read: the embed's shorter profile stands in, and the log says so.
-        let profile;
-        try {
-          profile = await ttFetchProfile(entry.uniqueId);
-        } catch (err) {
-          if (err && err.ttNoProfile) throw err;
-          if (!embed) embed = await ttFetchEmbed(entry.uniqueId).catch(() => null);
-          profile = embed && ttProfileFromEmbed(embed.user);
-          if (!profile) throw err;
-          const reason = err instanceof Error ? err.message : String(err);
-          log(`NOTE ${label}: profile page unreadable (${reason}) - using its embed instead.`);
-        }
-        // The on-screen pass only knew a handle, so this is the first chance to
-        // see the id — and to notice a creator collected under an older handle.
-        if (!entry.id && known.has(profile.id)) {
-          log(`SKIP ${label}: already collected.`);
+      if (sweep.queue.length) {
+        const entry = sweep.queue.shift();
+        sweep.stats.considered += 1;
+        if ((await ttPreCheck(entry, sweep)) === "drop") {
+          persist();
           continue;
         }
-        known.add(profile.id);
+        entry.visits = 1;
+        sweep.current = entry;
+        persist();
+        await sleep(TT_ENRICH_DELAY_MS);
+        if (stopRequested || !loadState().running) break;
+        location.assign(`${TT_ORIGIN}/@${encodeURIComponent(entry.uniqueId)}`);
+        return "navigating";
+      }
 
-        const record = {
-          platform: platform.value,
-          platform_id: profile.id,
-          name: profile.name || entry.name || profile.uniqueId,
-          handle: `@${profile.uniqueId}`,
-          profile_url: `${TT_ORIGIN}/@${profile.uniqueId}`,
-          avatar_url: profile.avatarUrl || entry.avatarUrl,
-          subscriber_count: profile.followers ?? entry.followers ?? null,
-          video_count: profile.videos,
-          // TikTok publishes no lifetime view total. Likes received is the
-          // nearest audience signal it does publish, so it travels in its own
-          // field instead of being passed off as views.
-          view_count: null,
-          like_count: profile.likes,
-          description: profile.description,
-          links: profile.links,
-          country: profile.country,
-          discovered_via: query,
-          captured_at: capturedAt,
-          // Omitted rather than empty when the list was not read — same reason
-          // as on YouTube: the CRM reads an empty array as "no uploads".
-          ...(recentVideos.length ? { recent_videos: recentVideos } : {}),
-        };
-        const state = loadState();
-        state.creators = (state.creators || []).concat([record]);
-        saveState(state);
-        stats.kept += 1;
-        const followers = record.subscriber_count === null ? "hidden" : record.subscriber_count;
-        const freshness =
-          uploadAgeDays === null ? "" : `, last upload ${formatUploadAge(uploadAgeDays)}`;
-        log(
-          `OK ${record.name} - ${followers} followers, ` +
-            `${record.links.length} link(s)${freshness}`,
+      if (sweep.passIndex < TT_DISCOVERY_PASSES.length) {
+        const pass = TT_DISCOVERY_PASSES[sweep.passIndex];
+        sweep.passIndex += 1;
+        persist();
+
+        let fetchPage;
+        try {
+          fetchPage = await pass.open(sweep.query);
+        } catch (err) {
+          sweep.refused = sweep.refused || Boolean(err && err.ttRefused);
+          log(`${pass.label} search failed: ${err instanceof Error ? err.message : String(err)}`);
+          persist();
+          continue;
+        }
+        if (!fetchPage) {
+          log(`${pass.label}: nothing for "${sweep.query}".`);
+          continue;
+        }
+
+        const result = await ttPageThrough(
+          pass.label,
+          fetchPage,
+          pass.extract,
+          known,
+          discoveryAppetite(sweep.target, sweep.stats),
         );
-      } catch (err) {
-        // One unreadable account must never abort the sweep.
-        const message = err instanceof Error ? err.message : String(err);
-        log(`SKIP ${label}: ${message}`);
+        sweep.refused = sweep.refused || result.refused;
+        sweep.stats.discovered += result.found.length;
+        if (result.found.length === 0) {
+          if (!result.refused) log(`${pass.label}: nothing new.`);
+          persist();
+          continue;
+        }
+        sweep.queue.push(...result.found);
+        log(`Opening ${result.found.length} profile(s) one by one...`);
+        persist();
+        continue;
       }
-      refreshUI();
-      await sleep(TT_ENRICH_DELAY_MS);
+
+      break;
     }
+
+    ttFinishSweep(sweep);
+    return "done";
   }
 
-  // Run one TikTok sweep: the API passes in order, then the on-screen pass when
-  // the tab is on a results page. Ends when the target is met, every source is
-  // exhausted, or the operator stops — and says which, like collectCreators.
-  async function ttCollectCreators(query) {
-    const known = new Set();
-    for (const row of loadState().creators || []) {
-      if (row.platform_id) known.add(String(row.platform_id));
-      if (row.handle) known.add(String(row.handle).toLowerCase());
-    }
-    const ctx = {
-      query,
-      capturedAt: new Date().toISOString(),
-      platform: getCreatorPlatform(),
-      target: getTargetCount("creators"),
-      gapDays: getUploadGapDays(),
-      stats: { considered: 0, kept: 0, dropped: 0, discovered: 0 },
-      known,
-    };
-    const { target, gapDays, stats } = ctx;
-    let refused = false;
-
-    log(
-      target > 0
-        ? `Sweeping TikTok for "${query}" - target ${target} creator(s).`
-        : `Sweeping TikTok for "${query}" - no target, collecting everything.`,
-    );
-    log(
-      gapDays > 0
-        ? `Dropping any account with no upload in the last ${gapDays} days.`
-        : "No freshness filter - collecting accounts whenever they last posted.",
-    );
-
-    for (const pass of TT_DISCOVERY_PASSES) {
-      if (stopRequested) break;
-      if (target > 0 && targetReached("creators")) break;
-      let fetchPage;
-      try {
-        fetchPage = await pass.open(query);
-      } catch (err) {
-        refused = refused || Boolean(err && err.ttRefused);
-        log(`${pass.label} search failed: ${err instanceof Error ? err.message : String(err)}`);
-        continue;
-      }
-      if (!fetchPage) {
-        log(`${pass.label}: nothing for "${query}".`);
-        continue;
-      }
-
-      const result = await ttPageThrough(
-        pass.label,
-        fetchPage,
-        pass.extract,
-        known,
-        discoveryAppetite(target, stats),
-      );
-      refused = refused || result.refused;
-      stats.discovered += result.found.length;
-
-      if (result.found.length === 0) {
-        if (!result.refused) log(`${pass.label}: nothing new.`);
-        continue;
-      }
-
-      await ttHarvestAccounts(result.found, ctx);
-
-      if (!stopRequested && (target === 0 || !targetReached("creators"))) {
-        await sleep(TT_PASS_DELAY_MS);
-      }
-    }
-
-    if (!stopRequested && (target === 0 || !targetReached("creators"))) {
-      if (ttOnResultsPage()) {
-        const found = await ttScreenPass(known, discoveryAppetite(target, stats));
-        stats.discovered += found.length;
-        if (found.length) {
-          await ttHarvestAccounts(found, { ...ctx, query: ttScreenQuery() || query });
-        }
-      } else if (refused) {
-        log(
-          "TikTok would not answer the search API. Make sure you are logged in, then open " +
-            `${TT_ORIGIN}/search/video?q=${encodeURIComponent(query)} and press Start again - ` +
-            "the sweep will read the results on screen instead.",
-        );
-      }
-    }
-
+  function ttFinishSweep(sweep) {
+    const { stats, gapDays, target, query } = sweep;
     if (stats.dropped > 0) {
       log(`Dropped ${stats.dropped} account(s) - no verified upload in the last ${gapDays} days.`);
     }
     if (stats.discovered === 0) {
-      log("Nothing new found for that term.");
+      log(
+        sweep.refused
+          ? "TikTok would not answer the search API. Make sure you are logged in, then open " +
+              `${TT_ORIGIN}/search/video?q=${encodeURIComponent(query)} and press Start ` +
+              "again - the sweep will read the results on screen instead."
+          : "Nothing new found for that term.",
+      );
     } else if (target > 0 && !targetReached("creators") && !stopRequested) {
       log(
         `Every search source is exhausted for "${query}" and the target is still ` +
@@ -1868,6 +2018,62 @@
           "Try another search term, or widen Last upload.",
       );
     }
+    ttClearSweep();
+  }
+
+  // Start a TikTok sweep. When the tab is on a search or hashtag page, what is
+  // on screen is read first — before the sweep navigates away from it.
+  async function ttCollectCreators(query) {
+    const known = new Set();
+    for (const row of loadState().creators || []) {
+      if (row.platform_id) known.add(String(row.platform_id));
+      if (row.handle) known.add(String(row.handle).toLowerCase());
+    }
+    const sweep = {
+      query,
+      capturedAt: new Date().toISOString(),
+      target: getTargetCount("creators"),
+      gapDays: getUploadGapDays(),
+      stats: { considered: 0, kept: 0, dropped: 0, discovered: 0 },
+      passIndex: 0,
+      queue: [],
+      current: null,
+      known: [],
+      refused: false,
+      embedDown: false,
+    };
+
+    log(
+      sweep.target > 0
+        ? `Sweeping TikTok for "${query}" - target ${sweep.target} creator(s).`
+        : `Sweeping TikTok for "${query}" - no target, collecting everything.`,
+    );
+    log(
+      sweep.gapDays > 0
+        ? `Dropping any account with no upload in the last ${sweep.gapDays} days.`
+        : "No freshness filter - collecting accounts whenever they last posted.",
+    );
+
+    if (ttOnResultsPage()) {
+      const via = ttScreenQuery() || query;
+      const found = await ttScreenPass(known, discoveryAppetite(sweep.target, sweep.stats));
+      for (const entry of found) entry.via = via;
+      sweep.stats.discovered += found.length;
+      sweep.queue.push(...found);
+    }
+
+    sweep.known = [...known];
+    ttSaveSweep(sweep);
+    return ttContinueSweep();
+  }
+
+  // Pick a sweep back up after a profile visit reloaded the page.
+  async function ttResumeSweepIfNeeded() {
+    const state = loadState();
+    if (!state.running || !state.ttSweep) return;
+    stopRequested = false;
+    const outcome = await ttContinueSweep();
+    if (outcome === "done") finishCreatorRun();
   }
 
   const DISCOVER_DRY_STREAK_LIMIT = 4;
@@ -4748,6 +4954,8 @@
 
     const state = loadState();
     state.running = false;
+    // A TikTok sweep resumes from this on the next page load; Stop ends it.
+    state.ttSweep = null;
     state.discoverPhase = "idle";
     state.discoverLastAddedAt = 0;
     state.statusText = `Stopped. ${formatCollectionSummary((state.inviteUrls || []).length)}`;
@@ -4860,6 +5068,13 @@
   function clearStaleRunningFlag() {
     const state = loadState();
     if (!state.running) return;
+    // A TikTok sweep reloads the page on every profile it opens; a recent one
+    // is resumed, not cleared.
+    const sweep = state.ttSweep;
+    if (SITE === "tiktok" && sweep && Date.now() - (sweep.updatedAt || 0) < TT_SWEEP_STALE_MS) {
+      return;
+    }
+    state.ttSweep = null;
     if (SITE !== "discord" || getActiveTab() === "creators") {
       state.running = false;
       state.statusText = "";
@@ -4922,6 +5137,11 @@
           z-index: 99999;
           width: 460px;
           max-width: calc(100vw - 24px);
+          /* Never taller than the window: the body scrolls instead, so the
+             panel cannot run off the bottom of a short screen. */
+          max-height: calc(100vh - 24px);
+          display: flex;
+          flex-direction: column;
           background: var(--dic-background-100);
           border: 1px solid var(--dic-gray-400);
           border-radius: var(--dic-radius-xl);
@@ -4941,6 +5161,7 @@
           box-sizing: border-box;
         }
         #dic-header {
+          flex: none;
           padding: 8px 16px;
           background: var(--dic-background-100);
           border-radius: var(--dic-radius-xl) var(--dic-radius-xl) 0 0;
@@ -5032,6 +5253,8 @@
           display: flex;
           flex-direction: column;
           gap: 16px;
+          min-height: 0;
+          overflow-y: auto;
         }
         /* Tabs: a muted track with the active trigger raised on it. */
         #dic-tabs {
@@ -5635,9 +5858,13 @@
 
     document.addEventListener("mousemove", (e) => {
       if (!dragging) return;
+      // The header stays on screen, so the panel can always be dragged back,
+      // and the panel is capped to the room left below where it sits.
+      const top = Math.min(Math.max(e.clientY - dy, 0), window.innerHeight - 48);
       panel.style.left = `${e.clientX - dx}px`;
-      panel.style.top = `${e.clientY - dy}px`;
+      panel.style.top = `${top}px`;
       panel.style.right = "auto";
+      panel.style.maxHeight = `${Math.max(window.innerHeight - top - 12, 120)}px`;
     });
 
     document.addEventListener("mouseup", () => {
@@ -5904,6 +6131,22 @@
     refreshCounts();
   }
 
+  function finishCreatorRun() {
+    const doneState = loadState();
+    doneState.running = false;
+    doneState.ttSweep = null;
+    const total = (doneState.creators || []).length;
+    const creatorTarget = getTargetCount("creators");
+    doneState.statusText =
+      creatorTarget > 0 && total >= creatorTarget
+        ? `Target reached. ${total} creator(s) collected.`
+        : stopRequested
+          ? `Stopped. ${total} creator(s) collected.`
+          : `Finished. ${total} creator(s) collected.`;
+    saveState(doneState);
+    refreshUI();
+  }
+
   async function startCollection() {
     try {
       stopRequested = false;
@@ -5925,23 +6168,16 @@
         saveState(creatorState);
         refreshUI();
         try {
-          await (platform.value === "tiktok" ? ttCollectCreators(query) : collectCreators(query));
+          const outcome = await (platform.value === "tiktok"
+            ? ttCollectCreators(query)
+            : collectCreators(query));
+          // A TikTok sweep continues on the profile page it just opened.
+          if (outcome === "navigating") return;
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           logError(`ERROR: ${message}`, err);
         }
-        const doneState = loadState();
-        doneState.running = false;
-        const total = (doneState.creators || []).length;
-        const creatorTarget = getTargetCount("creators");
-        doneState.statusText =
-          creatorTarget > 0 && total >= creatorTarget
-            ? `Target reached. ${total} creator(s) collected.`
-            : stopRequested
-              ? `Stopped. ${total} creator(s) collected.`
-              : `Finished. ${total} creator(s) collected.`;
-        saveState(doneState);
-        refreshUI();
+        finishCreatorRun();
         return;
       }
 
@@ -6044,6 +6280,12 @@
 
   clearStaleRunningFlag();
   createUI();
+
+  if (SITE === "tiktok") {
+    ttResumeSweepIfNeeded().catch((err) => {
+      logError("TikTok sweep resume failed", err);
+    });
+  }
 
   // Discord-only startup. The off-site click guard exists to stop a Discover
   // scan wandering out of Discord, and the resume path reattaches an interrupted

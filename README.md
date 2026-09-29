@@ -136,23 +136,23 @@ replies with an **empty** body, not an error — the log says so, and the fix is
 `https://www.tiktok.com/search/video?q=<term>` and press Start again: the on-screen pass then reads
 the results you can see, which needs no signature.
 
-**Freshness** is read from the account's **creator embed** (`/embed/@handle`) — TikTok's public embed
-widget, whose HTML lists the account's newest videos. The embed shows no dates, but a TikTok video id
-carries its creation time in its top 32 bits, so each id dates its upload without any localized "2d
-ago" text. The same read supplies the three newest videos for the CRM podium (`recent_videos`). A
-video the sweep already saw in search counts too. An account neither source can date is dropped as
-`could not check uploads`; a private account has no embed and is named as such.
+**Each account is read by opening its profile in your tab.** You will see the tab move from profile to
+profile; the panel follows along and the sweep resumes itself after every page load. This is
+deliberate: in live use TikTok answered *background* fetches of profile and embed pages with 503s and
+with pages stripped of their data, while the very same profiles opened normally. A real visit gets the
+page you would see — the full profile data in the document and, signed in, the video grid. **Stop**
+ends the sweep; a sweep abandoned for more than 10 minutes (tab closed) is not resumed.
 
-The video-list API (`/api/post/item_list/`) is not used: it answers with an empty body even to
-TikTok's own app when that is not signed in, which in live use meant nearly every account went
-unchecked.
+**Freshness.** Before opening an account, the sweep tries its **creator embed** (`/embed/@handle`),
+TikTok's public embed widget, whose HTML lists the newest videos: a dead account is dropped there
+without a visit, and the embed's videos become the CRM podium (`recent_videos`). If embeds do not
+answer, that is noted once and every account is judged on its profile instead, by the video links in
+its grid. A TikTok video id carries its creation time in its top 32 bits, so a link alone dates an
+upload, with no localized "2d ago" text involved. A video the sweep already saw in search also counts.
+An account nothing can date is dropped as `could not check uploads`.
 
-**Profiles** come from the server-rendered `/@handle` page, which embeds the whole profile as JSON
-(`__UNIVERSAL_DATA_FOR_REHYDRATION__`) and needs no signature. Both the profile and the embed are
-fetched **without your cookies**: signed in, TikTok served most profile pages without their data,
-while the anonymous pages read every time in testing. If a profile page still cannot be read, the
-embed's shorter profile (no bio link or video count) stands in and the log says `NOTE … using its
-embed instead`, so a live account is never lost to it.
+**TikTok puzzles.** If a verification puzzle appears on a profile, the log says so and the sweep waits
+(up to three minutes) for you to solve it, then carries on.
 
 | Field | Notes |
 | --- | --- |
