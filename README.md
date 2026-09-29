@@ -4,7 +4,8 @@ A [Tampermonkey](https://www.tampermonkey.net/) userscript that collects prospec
 session list you can copy out in one click. Two tabs:
 
 - **Servers** — scans Discord web pages for server invite URLs.
-- **Creators** — sweeps YouTube search for channels and collects them as SpokPayCRM creator records.
+- **Creators** — sweeps YouTube or TikTok search for creators and collects them as SpokPayCRM creator
+  records.
 
 It is fully self-contained: no API key, no database, no external service. Nothing is ever sent
 anywhere — whatever it finds stays in the panel and in `localStorage` until you copy or clear it. The
@@ -17,17 +18,19 @@ CRM is fed by pasting, never by an automatic import.
    **[install the script](https://raw.githubusercontent.com/RDevNeo/spok-lead-collector/main/lead-collector.user.js)**
    — Tampermonkey recognizes the `// ==UserScript==` header and opens its install prompt. (Installing
    from this URL is what registers the auto-update source; a copy-pasted script never updates itself.)
-3. Open Discord web (`https://discord.com/*`) or YouTube (`https://www.youtube.com/*`) — the
-   collector panel is injected on load, opening on whichever tab that site can run.
+3. Open Discord web (`https://discord.com/*`), YouTube (`https://www.youtube.com/*`) or TikTok
+   (`https://www.tiktok.com/*`) — the collector panel is injected on load, opening on whichever tab
+   that site can run.
 
 Works on Discord **web** in any desktop browser with a userscript manager. It does not run inside the
 Discord desktop app, which has no userscript support.
 
 ## Tabs
 
-The panel opens on the tab the current site can actually run: Discord shows **Servers**, YouTube shows
-**Creators**. Selecting the other tab tells you where to go rather than offering controls that cannot
-work — server collection drives the Discord DOM, creator collection reads YouTube's own data.
+The panel opens on the tab the current site can actually run: Discord shows **Servers**, YouTube and
+TikTok show **Creators**. Selecting the other tab tells you where to go rather than offering controls
+that cannot work — server collection drives the Discord DOM, creator collection reads YouTube's or
+TikTok's own data.
 
 ## Target
 
@@ -38,9 +41,10 @@ cap the next server scan. Leave it blank to collect everything the source gives;
 
 ## Creators
 
-**Source** picks the platform to sweep. YouTube is the only one with a collector today; the rest are
-listed as *soon* and cannot be selected. Type a search term (e.g. `roblox blox fruits`) and press
-Start. The sweep searches YouTube
+**Source** picks the platform to sweep. YouTube and TikTok have collectors; the rest are listed as
+*soon* and cannot be selected. A sweep runs on the platform's own site — open youtube.com for YouTube,
+tiktok.com for TikTok (see [TikTok](#tiktok) below). Type a search term (e.g. `roblox blox fruits`) and
+press Start. The YouTube sweep searches
 across several surfaces, drops every channel that has not uploaded recently, then opens each
 survivor's About data for its stats and profile links.
 **Copy** puts the batch on your clipboard as JSONL — one complete JSON record per line — which is what
@@ -108,6 +112,54 @@ Two traps that cost real bugs while building it, both verified against live YouT
   `videoCountText` holds the *subscriber count*.
 - A link's `link.content` is only display text (`twitter.com/BloxFruits`); the real URL lives on the
   tap command and needs unwrapping from the `/redirect?q=` form.
+
+## TikTok
+
+Open `https://www.tiktok.com`, **logged in**, and the Creators tab sweeps TikTok the same way it sweeps
+YouTube: discover accounts for the search term, drop the ones that have not posted inside **Last
+upload**, read each survivor's profile, and store it as a creator record. Copy and the JSONL format are
+the same.
+
+**Where accounts come from**, in order, each harvested before the next runs:
+
+| Pass | Source |
+| --- | --- |
+| Accounts | TikTok's account search |
+| Videos | The general (Top) search — the author of every video in it |
+| Hashtag | The term read as a hashtag — `blox fruits` → `#bloxfruits` — skipped if no such tag exists |
+| On-screen results | Only when the tab is on a TikTok search or hashtag page: scrolls it and reads the result links |
+
+The first three are TikTok's own `/api/…` endpoints, which only answer requests carrying TikTok's
+signatures. The script never computes those itself: TikTok's security code already wraps the page's
+`fetch` and signs same-origin calls, and the script runs in the page. When TikTok will not answer — it
+replies with an **empty** body, not an error — the log says so, and the fix is to open
+`https://www.tiktok.com/search/video?q=<term>` and press Start again: the on-screen pass then reads
+the results you can see, which needs no signature.
+
+**Freshness** is dated two ways. The account's video list gives the newest upload and the three newest
+videos for the CRM podium (`recent_videos`). Failing that, the newest video the sweep already *saw*
+from that account counts: a TikTok video id carries its creation time in its top 32 bits, so even a
+bare `/video/<id>` link dates an upload without a request or any localized "2d ago" text. An account
+with neither is dropped as `could not check uploads`.
+
+**Profiles** come from the server-rendered `/@handle` page, which embeds the whole profile as JSON
+(`__UNIVERSAL_DATA_FOR_REHYDRATION__`) and needs no signature.
+
+| Field | Notes |
+| --- | --- |
+| `platform_id` | The numeric account id — stable across handle changes |
+| `handle`, `name`, `profile_url`, `avatar_url` | From the profile page. The avatar URL is signed by TikTok's CDN and **expires** |
+| `subscriber_count` | Followers, exact (not the rounded `96M` form) |
+| `video_count` | Public videos |
+| `view_count` | Always `null` — TikTok publishes no lifetime view total |
+| `like_count` | Total likes received — TikTok's nearest audience signal (TikTok only) |
+| `description` | The bio — where sellers usually put their WhatsApp, email or Discord |
+| `links` | The single bio link, when the account has one |
+| `country` | `null` unless TikTok includes a region in the profile |
+
+TikTok challenges automated traffic far more readily than YouTube, so the TikTok sweep paces itself
+slower. If a verification puzzle appears, solve it and press Start again; the log names it when it can
+see it.
 
 ## Server modes
 

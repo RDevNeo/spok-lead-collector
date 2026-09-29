@@ -2,7 +2,7 @@
 // @name         Lead Collector
 // @namespace    https://github.com/RDevNeo/lead-collector
 // @version      1.10.30
-// @description  Collect Discord server invites, and YouTube creator profiles, into SpokPayCRM.
+// @description  Collect Discord server invites, and YouTube and TikTok creator profiles, into SpokPayCRM.
 // @author       RDevNeo
 // @license      MIT
 // @homepageURL  https://github.com/RDevNeo/spok-lead-collector
@@ -11,6 +11,7 @@
 // @match        https://*.discord.com/*
 // @match        https://www.youtube.com/*
 // @match        https://m.youtube.com/*
+// @match        https://www.tiktok.com/*
 // @grant        none
 // @updateURL    https://raw.githubusercontent.com/RDevNeo/spok-lead-collector/main/lead-collector.user.js
 // @downloadURL  https://raw.githubusercontent.com/RDevNeo/spok-lead-collector/main/lead-collector.user.js
@@ -84,15 +85,19 @@
   // ===========================================================================
   // Site detection
   //
-  // The panel now runs on two sites. Server collection drives the Discord DOM
-  // and is meaningless on YouTube; creator collection reads YouTube's own JSON
-  // and is meaningless on Discord. So the tab matching the current site is the
-  // one that can actually run, and the other explains where to go.
+  // The panel runs on three sites. Server collection drives the Discord DOM and
+  // is meaningless elsewhere; creator collection reads YouTube's or TikTok's own
+  // data and is meaningless on Discord. So the tab matching the current site is
+  // the one that can actually run, and the other explains where to go.
   // ===========================================================================
-  const SITE = /(^|\.)youtube\.com$/i.test(location.hostname) ? "youtube" : "discord";
+  const SITE = /(^|\.)youtube\.com$/i.test(location.hostname)
+    ? "youtube"
+    : /(^|\.)tiktok\.com$/i.test(location.hostname)
+      ? "tiktok"
+      : "discord";
 
-  // Creator platforms the Creators tab can be pointed at. YouTube is the only one
-  // with a collector behind it; the others are listed as unavailable so the
+  // Creator platforms the Creators tab can be pointed at. YouTube and TikTok have
+  // collectors behind them; the others are listed as unavailable so the
   // dropdown shows where this is going without pretending they work — they are
   // rendered disabled and cannot be selected.
   //
@@ -116,10 +121,15 @@
       host: "instagram.com",
       available: false,
     },
-    { value: "tiktok", label: "TikTok", site: "tiktok", host: "tiktok.com", available: false },
+    { value: "tiktok", label: "TikTok", site: "tiktok", host: "tiktok.com", available: true },
     { value: "youtube", label: "YouTube", site: "youtube", host: "youtube.com", available: true },
   ];
-  const CREATOR_PLATFORM_FALLBACK = CREATOR_PLATFORMS.find((entry) => entry.available);
+  // The platform this site can sweep, so a fresh store on tiktok.com starts on
+  // TikTok and one on youtube.com on YouTube. Off those sites (Discord), the
+  // first available platform in priority order.
+  const CREATOR_PLATFORM_FALLBACK =
+    CREATOR_PLATFORMS.find((entry) => entry.available && entry.site === SITE) ||
+    CREATOR_PLATFORMS.find((entry) => entry.available);
   const CREATOR_PLATFORM_DEFAULT = CREATOR_PLATFORM_FALLBACK.value;
   const CREATOR_PLATFORM_SIGNATURE = CREATOR_PLATFORMS.map(
     (entry) => `${entry.value}${entry.available ? "" : "!"}`,
@@ -982,6 +992,795 @@
   }
 
 
+  // --- TikTok creator collection ---------------------------------------------
+  //
+  // Same shape as the YouTube sweep — discover, gate on freshness, read the
+  // profile, store — but TikTok splits its data across two kinds of source that
+  // behave very differently:
+  //
+  //   • Profile pages (`/@handle`) are server-rendered. The HTML carries a
+  //     `__UNIVERSAL_DATA_FOR_REHYDRATION__` JSON blob whose `webapp.user-detail`
+  //     scope holds the whole profile: id, bio, bio link, follower / like / video
+  //     counts. A plain same-origin fetch reads it — verified even logged out.
+  //
+  //   • Search results, hashtag feeds and an account's video list are in NO
+  //     HTML: the app asks `/api/...` for them. Those endpoints demand request
+  //     signatures (`X-Bogus`, `X-Gnarly`, `msToken`) and answer an unsigned
+  //     request with HTTP 200 and an EMPTY body rather than an error. TikTok's
+  //     own security SDK wraps the page's `fetch`/`XMLHttpRequest` and signs the
+  //     same-origin calls made through them, and `@grant none` runs this script
+  //     in the page, so its `fetch` IS the wrapped one. The script never builds
+  //     a signature itself: if the SDK stops signing, the empty reply is
+  //     detected and reported, not worked around.
+  //
+  // When the signed search will not answer, the on-screen pass reads the search
+  // or hashtag page the operator already has open instead — see ttScreenPass.
+
+  const TT_ORIGIN = "https://www.tiktok.com";
+
+  // Slower than YouTube on every step. TikTok puts up a verification puzzle far
+  // more readily, and one mid-sweep costs more than the seconds saved.
+  const TT_PAGE_DELAY_MS = 900;
+  const TT_PASS_DELAY_MS = 1200;
+  const TT_ENRICH_DELAY_MS = 800;
+  const TT_FEED_DELAY_MS = 400;
+  const TT_SCROLL_DELAY_MS = 1800;
+
+  // Safety stop only, like YT_MAX_PAGES.
+  const TT_MAX_PAGES = 60;
+  // TikTok's search does not pad pages the way YouTube's does, so a short run of
+  // pages with nobody new really is the end of the vein.
+  const TT_DRY_PAGE_LIMIT = 3;
+  const TT_SCROLL_DRY_LIMIT = 4;
+  // Enough of an account's newest videos that a few pinned (old) ones at the top
+  // cannot crowd the real newest upload out of the list.
+  const TT_FEED_COUNT = 16;
+
+  // Discovery passes, run in order until the target is met. Each ranks
+  // differently and so returns a different set — the same reasoning as
+  // YT_DISCOVERY_PASSES. `open` returns the pass's page fetcher, or null when
+  // the pass does not apply to the term (a term that is no hashtag).
+  const TT_DISCOVERY_PASSES = [
+    {
+      label: "Accounts",
+      extract: ttSightingsFromUserSearch,
+      open: async (query) => (page) =>
+        ttFetchJson("/api/search/user/full/", {
+          keyword: query,
+          cursor: page.cursor,
+          search_id: page.searchId,
+          from_page: "search",
+        }),
+    },
+    {
+      label: "Videos",
+      extract: ttSightingsFromGeneralSearch,
+      open: async (query) => (page) =>
+        ttFetchJson("/api/search/general/full/", {
+          keyword: query,
+          offset: page.cursor,
+          search_id: page.searchId,
+          from_page: "search",
+        }),
+    },
+    {
+      label: "Hashtag",
+      extract: ttSightingsFromItemList,
+      open: async (query) => {
+        const tag = ttHashtagFromQuery(query);
+        if (!tag) return null;
+        const detail = await ttFetchJson("/api/challenge/detail/", { challengeName: tag });
+        const challengeId = detail.challengeInfo?.challenge?.id;
+        if (!challengeId) return null;
+        return (page) =>
+          ttFetchJson("/api/challenge/item_list/", {
+            challengeID: challengeId,
+            count: 30,
+            cursor: page.cursor,
+            from_page: "hashtag",
+          });
+      },
+    },
+  ];
+
+  // "blox fruits" → "bloxfruits", "#Roblox" → "roblox". Null for anything that
+  // could not be a hashtag, so the pass is skipped instead of asking TikTok for
+  // a tag that cannot exist.
+  function ttHashtagFromQuery(query) {
+    const tag = String(query || "")
+      .replace(/^#/, "")
+      .replace(/\s+/g, "")
+      .toLowerCase();
+    return /^[\p{L}\p{N}_]+$/u.test(tag) ? tag : null;
+  }
+
+  // Whether the page is showing TikTok's verification puzzle. Matched on the
+  // id/class NAME rather than any visible text, which is localized.
+  function ttVerificationShowing() {
+    return Boolean(document.querySelector('[id*="captcha" i], [class*="captcha" i]'));
+  }
+
+  function ttExtractUniversalData(html) {
+    const match = html.match(
+      /<script[^>]+id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>([\s\S]*?)<\/script>/,
+    );
+    if (!match) return null;
+    try {
+      const data = JSON.parse(match[1]);
+      return (data && data.__DEFAULT_SCOPE__) || null;
+    } catch {
+      return null;
+    }
+  }
+
+  // The current page's app context: region, UI language and the web device id
+  // the API expects. Read from the tab's own rehydration blob; an empty object
+  // when it is gone, which only costs the optional parameters.
+  function ttPageContext() {
+    const script = document.getElementById("__UNIVERSAL_DATA_FOR_REHYDRATION__");
+    try {
+      const data = JSON.parse(script ? script.textContent : "");
+      return (data.__DEFAULT_SCOPE__ && data.__DEFAULT_SCOPE__["webapp.app-context"]) || {};
+    } catch {
+      return {};
+    }
+  }
+
+  // The query every TikTok web API call carries. The endpoints are strict about
+  // looking like the web app's own requests, so this mirrors the parameters the
+  // app sends; the signatures are added by TikTok's SDK on the way out.
+  function ttApiUrl(path, params) {
+    const context = ttPageContext();
+    const language = context.language || String(navigator.language || "en").split("-")[0];
+    const query = new URLSearchParams({
+      aid: "1988",
+      app_name: "tiktok_web",
+      app_language: language,
+      browser_language: navigator.language || language,
+      browser_name: "Mozilla",
+      browser_online: "true",
+      browser_platform: navigator.platform || "",
+      browser_version: navigator.appVersion || "",
+      channel: "tiktok_web",
+      cookie_enabled: "true",
+      device_platform: "web_pc",
+      focus_state: "true",
+      is_fullscreen: "false",
+      is_page_visible: "true",
+      region: context.region || "",
+      screen_height: String(screen.height),
+      screen_width: String(screen.width),
+      tz_name: Intl.DateTimeFormat().resolvedOptions().timeZone || "",
+      webcast_language: language,
+    });
+    if (context.wid) query.set("device_id", context.wid);
+    for (const [key, value] of Object.entries(params)) {
+      if (value === undefined || value === null || value === "") continue;
+      query.set(key, String(value));
+    }
+    return `${TT_ORIGIN}${path}?${query}`;
+  }
+
+  // GET one TikTok API endpoint. An empty body is TikTok REFUSING the request —
+  // unsigned, rate-limited, or waiting on a puzzle — and is flagged `ttRefused`
+  // because every further call will fail the same way until the operator acts.
+  async function ttFetchJson(path, params) {
+    const res = await fetch(ttApiUrl(path, params), { credentials: "include" });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const text = await res.text();
+    if (!text.trim()) {
+      const err = new Error(
+        ttVerificationShowing()
+          ? "TikTok is showing a verification puzzle"
+          : "TikTok sent an empty reply (request not signed, or rate-limited)",
+      );
+      err.ttRefused = true;
+      throw err;
+    }
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      throw new Error("TikTok reply was not JSON");
+    }
+    const status = Number(data.status_code ?? data.statusCode ?? 0);
+    if (status !== 0) {
+      const detail = data.status_msg || data.statusMsg;
+      throw new Error(`TikTok status ${status}${detail ? ` (${detail})` : ""}`);
+    }
+    return data;
+  }
+
+  // First finite number among the candidates. Profiles carry counts twice:
+  // `stats` rounds big numbers (96000000) while `statsV2` has the exact figure
+  // as a string ("95968250"), so callers list the exact source first. Null —
+  // not 0 — when nothing is there, same contract as ytParseCount.
+  function ttCount(...candidates) {
+    for (const value of candidates) {
+      if (value === undefined || value === null || value === "") continue;
+      const parsed = Number(value);
+      if (Number.isFinite(parsed)) return parsed;
+    }
+    return null;
+  }
+
+  // A TikTok item id carries its creation time: the top 32 bits of the 64-bit
+  // id are the Unix time in seconds (TikTok's own documented example,
+  // 6718335390845095173, decodes to 27 Jul 2019 — the day it was posted). That
+  // turns a bare video LINK, which is all the on-screen pass can see, into an
+  // absolute upload date with no request and no localized "2d ago" to parse.
+  function ttTimeFromItemId(id) {
+    const text = String(id || "");
+    if (!/^\d{15,20}$/.test(text)) return null;
+    try {
+      const ms = Number(BigInt(text) >> 32n) * 1000;
+      // Anything before TikTok existed, or in the future, is not a real id.
+      return ms > Date.UTC(2016, 0, 1) && ms < Date.now() + 86400000 ? ms : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function ttItemTime(item) {
+    const seconds = Number(item && item.createTime);
+    if (Number.isFinite(seconds) && seconds > 0) return seconds * 1000;
+    return ttTimeFromItemId(item && item.id);
+  }
+
+  // Search results give avatars as `{url_list: [...]}`, web items as a string.
+  function ttAvatar(value) {
+    if (!value) return null;
+    if (typeof value === "string") return value;
+    const list = value.url_list || value.urlList || [];
+    return list.length ? list[0] : null;
+  }
+
+  // One sighting of an account in discovery. Search results (snake_case) and
+  // web items (camelCase) name the same fields differently; both are read.
+  function ttUserSighting(info) {
+    if (!info || typeof info !== "object") return null;
+    const uniqueId = info.unique_id || info.uniqueId;
+    const id = String(info.uid || info.id || "");
+    if (!uniqueId || !id) return null;
+    return {
+      id,
+      secUid: info.sec_uid || info.secUid || null,
+      uniqueId,
+      name: info.nickname || null,
+      avatarUrl: ttAvatar(info.avatar_thumb || info.avatarThumb || info.avatarMedium),
+      followers: ttCount(info.follower_count),
+      latestVideoAt: null,
+    };
+  }
+
+  // A video's author, dated by the video. The date is what lets the freshness
+  // gate answer for free when the account's own video list will not.
+  function ttItemSighting(item) {
+    const sighting = ttUserSighting(item && item.author);
+    if (!sighting) return null;
+    sighting.followers = ttCount(
+      item.authorStatsV2?.followerCount,
+      item.authorStats?.followerCount,
+      sighting.followers,
+    );
+    sighting.latestVideoAt = ttItemTime(item);
+    return sighting;
+  }
+
+  function ttSightingsFromUserSearch(data) {
+    return (data.user_list || [])
+      .map((row) => ttUserSighting(row && row.user_info))
+      .filter(Boolean);
+  }
+
+  // General search mixes result kinds in one `data` list: videos arrive as
+  // `{type: 1, item}` and account carousels carry a `user_list`. Both are read;
+  // anything else (lives, sounds, hashtags) is skipped.
+  function ttSightingsFromGeneralSearch(data) {
+    const out = [];
+    for (const row of data.data || []) {
+      if (!row) continue;
+      const fromItem = row.item ? ttItemSighting(row.item) : null;
+      if (fromItem) out.push(fromItem);
+      for (const user of row.user_list || []) {
+        const fromUser = ttUserSighting(user && user.user_info);
+        if (fromUser) out.push(fromUser);
+      }
+    }
+    return out;
+  }
+
+  function ttSightingsFromItemList(data) {
+    return (data.itemList || data.item_list || []).map(ttItemSighting).filter(Boolean);
+  }
+
+  // Fold one sighting into this pass's queue. Returns true only for an account
+  // not seen before, in this sweep or in the stored collection. A repeat
+  // sighting still counts for something: the same creator turns up once per
+  // video, and keeping the NEWEST video seen lets the gate skip a request.
+  //
+  // Accounts are keyed by numeric id; the on-screen pass only knows handles, so
+  // `known` holds both forms and either one marks the account as taken.
+  function ttAddSighting(found, known, sighting) {
+    const handleKey = `@${sighting.uniqueId.toLowerCase()}`;
+    const key = sighting.id || handleKey;
+    const existing = found.get(key);
+    if (existing) {
+      if ((sighting.latestVideoAt || 0) > (existing.latestVideoAt || 0)) {
+        existing.latestVideoAt = sighting.latestVideoAt;
+      }
+      return false;
+    }
+    if (known.has(key) || known.has(handleKey)) return false;
+    known.add(key);
+    known.add(handleKey);
+    found.set(key, { ...sighting, key });
+    return true;
+  }
+
+  // Page through one API pass until it runs dry, the target is met, TikTok
+  // refuses, or the operator stops. Never throws: a failure after the first page
+  // keeps what was already found, and `refused` tells the sweep why it ended.
+  async function ttPageThrough(label, fetchPage, extract, known, wanted) {
+    const found = new Map();
+    const page = { cursor: 0, searchId: "" };
+    let dryPages = 0;
+    let refused = false;
+
+    for (let index = 1; index <= TT_MAX_PAGES; index += 1) {
+      if (stopRequested) break;
+
+      let data;
+      try {
+        data = await fetchPage(page);
+      } catch (err) {
+        refused = Boolean(err && err.ttRefused);
+        log(`${label} page ${index} failed: ${err instanceof Error ? err.message : String(err)}`);
+        break;
+      }
+
+      let fresh = 0;
+      for (const sighting of extract(data)) {
+        if (ttAddSighting(found, known, sighting)) fresh += 1;
+      }
+
+      if (fresh === 0) {
+        dryPages += 1;
+        if (dryPages >= TT_DRY_PAGE_LIMIT) {
+          log(`${label}: no new accounts for ${dryPages} pages - source exhausted.`);
+          break;
+        }
+      } else {
+        dryPages = 0;
+        log(`${label} page ${index}: ${fresh} new account(s). ${found.size} queued.`);
+      }
+
+      if (wanted > 0 && found.size >= wanted) {
+        log(`${label}: enough accounts for the target.`);
+        break;
+      }
+
+      const more = Boolean(data.has_more ?? data.hasMore);
+      const cursor = Number(data.cursor);
+      if (!more || !Number.isFinite(cursor) || cursor === page.cursor) {
+        log(`${label}: no further pages.`);
+        break;
+      }
+      page.cursor = cursor;
+      page.searchId = data.log_pb?.impr_id || data.extra?.logid || page.searchId;
+      await sleep(TT_PAGE_DELAY_MS);
+    }
+
+    return { found: [...found.values()], refused };
+  }
+
+  // --- On-screen pass --------------------------------------------------------
+  //
+  // Reads the search or hashtag page the operator has open: the fallback for
+  // when the signed API will not answer, since it needs nothing but links that
+  // are already rendered. Only `href`s are read — `/@handle` for accounts and
+  // `/@handle/video/<id>` for videos, whose id also dates the upload (see
+  // ttTimeFromItemId) — so no localized text is involved.
+  //
+  // Links inside nav/header/aside are skipped: that is where TikTok puts the
+  // operator's own profile and the "following" list, neither of which is a
+  // search result.
+
+  function ttOnResultsPage() {
+    return /^\/(search|tag)(\/|$)/.test(location.pathname);
+  }
+
+  // What the open results page is FOR — its `?q=` or its hashtag — so records
+  // found on it say what actually surfaced them.
+  function ttScreenQuery() {
+    const q = new URLSearchParams(location.search).get("q");
+    if (q) return q;
+    const tag = location.pathname.match(/^\/tag\/([^/]+)/);
+    return tag ? `#${decodeURIComponent(tag[1])}` : "";
+  }
+
+  function ttResultAnchors() {
+    return [...document.querySelectorAll('a[href*="/@"]')].filter(
+      (anchor) => !anchor.closest("#dic-panel, nav, header, aside"),
+    );
+  }
+
+  function ttSightingsOnScreen() {
+    const out = [];
+    for (const anchor of ttResultAnchors()) {
+      const match = (anchor.getAttribute("href") || "").match(/\/@([\w.]+)(?:\/video\/(\d+))?/);
+      if (!match) continue;
+      out.push({
+        id: null,
+        secUid: null,
+        uniqueId: match[1],
+        name: null,
+        avatarUrl: null,
+        followers: null,
+        latestVideoAt: match[2] ? ttTimeFromItemId(match[2]) : null,
+      });
+    }
+    return out;
+  }
+
+  // Scrolls by bringing the LAST result link into view rather than scrolling
+  // the window: on some layouts TikTok's result list lives in its own scroll
+  // container, and scrollIntoView reaches whichever one holds the link.
+  async function ttScreenPass(known, wanted) {
+    const found = new Map();
+    let dryRounds = 0;
+
+    for (let round = 1; round <= TT_MAX_PAGES; round += 1) {
+      if (stopRequested) break;
+      if (ttVerificationShowing()) {
+        log(
+          "On-screen results: TikTok is showing a verification puzzle - " +
+            "solve it and press Start again.",
+        );
+        break;
+      }
+
+      let fresh = 0;
+      for (const sighting of ttSightingsOnScreen()) {
+        if (ttAddSighting(found, known, sighting)) fresh += 1;
+      }
+      if (fresh === 0) {
+        dryRounds += 1;
+        if (dryRounds >= TT_SCROLL_DRY_LIMIT) {
+          log("On-screen results: nothing new after scrolling - end of the list.");
+          break;
+        }
+      } else {
+        dryRounds = 0;
+        log(`On-screen results: ${fresh} new account(s). ${found.size} queued.`);
+      }
+      if (wanted > 0 && found.size >= wanted) break;
+
+      const anchors = ttResultAnchors();
+      const last = anchors[anchors.length - 1];
+      if (last) last.scrollIntoView({ block: "end" });
+      else window.scrollBy(0, window.innerHeight);
+      await sleep(TT_SCROLL_DELAY_MS);
+    }
+
+    return [...found.values()];
+  }
+
+  // --- Freshness and profile -------------------------------------------------
+
+  // An account's newest videos from its video list: the newest time for the
+  // gate, and the top YT_RECENT_VIDEO_LIMIT for the CRM's "Most Recent" podium —
+  // the same `{ newest, videos }` contract as ytFetchRecentUploads. Pinned
+  // videos come first in this list whatever their age, hence taking the MAX
+  // time and sorting rather than trusting the order.
+  async function ttFetchRecentUploads(entry) {
+    const data = await ttFetchJson("/api/post/item_list/", {
+      secUid: entry.secUid,
+      count: TT_FEED_COUNT,
+      cursor: 0,
+    });
+
+    let newest = 0;
+    const videos = [];
+    for (const item of data.itemList || []) {
+      if (!item || !item.id) continue;
+      const time = ttItemTime(item);
+      if (time && time > newest) newest = time;
+      videos.push({
+        video_id: String(item.id),
+        title: String(item.desc || "").trim() || null,
+        url: `${TT_ORIGIN}/@${entry.uniqueId}/video/${item.id}`,
+        thumbnail_url: item.video?.cover || item.video?.originCover || null,
+        published_at: time ? new Date(time).toISOString() : null,
+        view_count: ttCount(item.statsV2?.playCount, item.stats?.playCount),
+      });
+    }
+
+    videos.sort((a, b) => {
+      const left = a.published_at ? Date.parse(a.published_at) : 0;
+      const right = b.published_at ? Date.parse(b.published_at) : 0;
+      return right - left;
+    });
+
+    return {
+      newest: newest > 0 ? newest : null,
+      videos: videos.slice(0, YT_RECENT_VIDEO_LIMIT),
+    };
+  }
+
+  // Read one profile from its server-rendered page. Needs no signature, which is
+  // why every record goes through here even when discovery already had a name.
+  async function ttFetchProfile(uniqueId) {
+    const res = await fetch(`${TT_ORIGIN}/@${encodeURIComponent(uniqueId)}`, {
+      credentials: "include",
+    });
+    if (!res.ok) throw new Error(`profile HTTP ${res.status}`);
+    const scope = ttExtractUniversalData(await res.text());
+    const detail = scope && scope["webapp.user-detail"];
+    if (!detail) {
+      throw new Error(
+        ttVerificationShowing()
+          ? "TikTok is showing a verification puzzle"
+          : "could not read profile data",
+      );
+    }
+    // 10221 is a banned or missing account; anything non-zero means no profile.
+    if (Number(detail.statusCode)) {
+      throw new Error(`profile unavailable (status ${detail.statusCode})`);
+    }
+
+    const info = detail.userInfo || {};
+    const user = info.user || {};
+    const stats = info.stats || {};
+    const statsV2 = info.statsV2 || {};
+    if (!user.id || !user.uniqueId) throw new Error("profile data had no account id");
+
+    // One bio link at most. Stored with a scheme so the CRM's link handling and
+    // the operator's click both get a real URL.
+    const links = [];
+    const bioLink = String((user.bioLink && user.bioLink.link) || "").trim();
+    if (bioLink) {
+      const url = /^https?:\/\//i.test(bioLink) ? bioLink : `https://${bioLink}`;
+      links.push({ label: null, url });
+    }
+
+    return {
+      id: String(user.id),
+      uniqueId: user.uniqueId,
+      name: user.nickname || null,
+      avatarUrl: user.avatarLarger || user.avatarMedium || user.avatarThumb || null,
+      followers: ttCount(statsV2.followerCount, stats.followerCount),
+      likes: ttCount(statsV2.heartCount, stats.heartCount, stats.heart),
+      videos: ttCount(statsV2.videoCount, stats.videoCount),
+      description: String(user.signature || "").trim() || null,
+      country: user.region || null,
+      links,
+    };
+  }
+
+  // --- TikTok sweep ----------------------------------------------------------
+
+  // Gate, read and store one batch of discovered accounts. Mirrors
+  // harvestChannels, including stopping the moment the target is met.
+  async function ttHarvestAccounts(entries, ctx) {
+    const { query, capturedAt, platform, target, gapDays, stats, known } = ctx;
+
+    log(
+      gapDays > 0
+        ? `Checking uploads on ${entries.length} account(s), then reading the live ones...`
+        : `Reading ${entries.length} profile(s)...`,
+    );
+
+    for (const entry of entries) {
+      if (stopRequested) break;
+      if (target > 0 && targetReached("creators")) {
+        log(`Target of ${target} creator(s) reached.`);
+        break;
+      }
+
+      const label = `@${entry.uniqueId}`;
+      stats.considered += 1;
+
+      // Freshness gate, ahead of the profile read. Two sources can date the
+      // newest upload: the account's video list (signed API; it also fills the
+      // podium) and the newest video this sweep already SAW from them in video
+      // or hashtag results (free). The second keeps the gate working when the
+      // list will not answer. With neither, the account is dropped — nothing
+      // unverified gets through, the same rule as on YouTube.
+      let uploadAgeDays = null;
+      let recentVideos = [];
+      if (gapDays > 0) {
+        let newest = entry.latestVideoAt || null;
+        let listError = "";
+        if (entry.secUid) {
+          try {
+            const feed = await ttFetchRecentUploads(entry);
+            recentVideos = feed.videos;
+            if (feed.newest && feed.newest > (newest || 0)) newest = feed.newest;
+          } catch (err) {
+            listError = err instanceof Error ? err.message : String(err);
+          }
+          await sleep(TT_FEED_DELAY_MS);
+        } else if (!newest) {
+          listError = "no video seen and no account id to list videos by";
+        }
+
+        if (!newest) {
+          stats.dropped += 1;
+          log(
+            listError
+              ? `DROP ${label}: could not check uploads (${listError}).`
+              : `DROP ${label}: no public uploads.`,
+          );
+          continue;
+        }
+
+        uploadAgeDays = daysSince(newest);
+        if (uploadAgeDays > gapDays) {
+          stats.dropped += 1;
+          log(
+            `DROP ${label}: dead - last upload ${formatUploadAge(uploadAgeDays)} ` +
+              `(limit ${gapDays} days).`,
+          );
+          continue;
+        }
+      }
+
+      try {
+        const profile = await ttFetchProfile(entry.uniqueId);
+        // The on-screen pass only knew a handle, so this is the first chance to
+        // see the id — and to notice a creator collected under an older handle.
+        if (!entry.id && known.has(profile.id)) {
+          log(`SKIP ${label}: already collected.`);
+          continue;
+        }
+        known.add(profile.id);
+
+        const record = {
+          platform: platform.value,
+          platform_id: profile.id,
+          name: profile.name || entry.name || profile.uniqueId,
+          handle: `@${profile.uniqueId}`,
+          profile_url: `${TT_ORIGIN}/@${profile.uniqueId}`,
+          avatar_url: profile.avatarUrl || entry.avatarUrl,
+          subscriber_count: profile.followers ?? entry.followers ?? null,
+          video_count: profile.videos,
+          // TikTok publishes no lifetime view total. Likes received is the
+          // nearest audience signal it does publish, so it travels in its own
+          // field instead of being passed off as views.
+          view_count: null,
+          like_count: profile.likes,
+          description: profile.description,
+          links: profile.links,
+          country: profile.country,
+          discovered_via: query,
+          captured_at: capturedAt,
+          // Omitted rather than empty when the list was not read — same reason
+          // as on YouTube: the CRM reads an empty array as "no uploads".
+          ...(recentVideos.length ? { recent_videos: recentVideos } : {}),
+        };
+        const state = loadState();
+        state.creators = (state.creators || []).concat([record]);
+        saveState(state);
+        stats.kept += 1;
+        const followers = record.subscriber_count === null ? "hidden" : record.subscriber_count;
+        const freshness =
+          uploadAgeDays === null ? "" : `, last upload ${formatUploadAge(uploadAgeDays)}`;
+        log(
+          `OK ${record.name} - ${followers} followers, ` +
+            `${record.links.length} link(s)${freshness}`,
+        );
+      } catch (err) {
+        // One unreadable account must never abort the sweep.
+        const message = err instanceof Error ? err.message : String(err);
+        log(`SKIP ${label}: ${message}`);
+      }
+      refreshUI();
+      await sleep(TT_ENRICH_DELAY_MS);
+    }
+  }
+
+  // Run one TikTok sweep: the API passes in order, then the on-screen pass when
+  // the tab is on a results page. Ends when the target is met, every source is
+  // exhausted, or the operator stops — and says which, like collectCreators.
+  async function ttCollectCreators(query) {
+    const known = new Set();
+    for (const row of loadState().creators || []) {
+      if (row.platform_id) known.add(String(row.platform_id));
+      if (row.handle) known.add(String(row.handle).toLowerCase());
+    }
+    const ctx = {
+      query,
+      capturedAt: new Date().toISOString(),
+      platform: getCreatorPlatform(),
+      target: getTargetCount("creators"),
+      gapDays: getUploadGapDays(),
+      stats: { considered: 0, kept: 0, dropped: 0, discovered: 0 },
+      known,
+    };
+    const { target, gapDays, stats } = ctx;
+    let refused = false;
+
+    log(
+      target > 0
+        ? `Sweeping TikTok for "${query}" - target ${target} creator(s).`
+        : `Sweeping TikTok for "${query}" - no target, collecting everything.`,
+    );
+    log(
+      gapDays > 0
+        ? `Dropping any account with no upload in the last ${gapDays} days.`
+        : "No freshness filter - collecting accounts whenever they last posted.",
+    );
+
+    for (const pass of TT_DISCOVERY_PASSES) {
+      if (stopRequested) break;
+      if (target > 0 && targetReached("creators")) break;
+
+      let fetchPage;
+      try {
+        fetchPage = await pass.open(query);
+      } catch (err) {
+        refused = refused || Boolean(err && err.ttRefused);
+        log(`${pass.label} search failed: ${err instanceof Error ? err.message : String(err)}`);
+        continue;
+      }
+      if (!fetchPage) {
+        log(`${pass.label}: nothing for "${query}".`);
+        continue;
+      }
+
+      const result = await ttPageThrough(
+        pass.label,
+        fetchPage,
+        pass.extract,
+        known,
+        discoveryAppetite(target, stats),
+      );
+      refused = refused || result.refused;
+      stats.discovered += result.found.length;
+
+      if (result.found.length === 0) {
+        if (!result.refused) log(`${pass.label}: nothing new.`);
+        continue;
+      }
+
+      await ttHarvestAccounts(result.found, ctx);
+
+      if (!stopRequested && (target === 0 || !targetReached("creators"))) {
+        await sleep(TT_PASS_DELAY_MS);
+      }
+    }
+
+    if (!stopRequested && (target === 0 || !targetReached("creators"))) {
+      if (ttOnResultsPage()) {
+        const found = await ttScreenPass(known, discoveryAppetite(target, stats));
+        stats.discovered += found.length;
+        if (found.length) {
+          await ttHarvestAccounts(found, { ...ctx, query: ttScreenQuery() || query });
+        }
+      } else if (refused) {
+        log(
+          "TikTok would not answer the search API. Make sure you are logged in, then open " +
+            `${TT_ORIGIN}/search/video?q=${encodeURIComponent(query)} and press Start again - ` +
+            "the sweep will read the results on screen instead.",
+        );
+      }
+    }
+
+    if (stats.dropped > 0) {
+      log(`Dropped ${stats.dropped} account(s) - no verified upload in the last ${gapDays} days.`);
+    }
+    if (stats.discovered === 0) {
+      log("Nothing new found for that term.");
+    } else if (target > 0 && !targetReached("creators") && !stopRequested) {
+      log(
+        `Every search source is exhausted for "${query}" and the target is still ` +
+          `${Math.max(target - currentCollectedCount("creators"), 0)} short. ` +
+          "Try another search term, or widen Last upload.",
+      );
+    }
+  }
+
   const DISCOVER_DRY_STREAK_LIMIT = 4;
 
   const DISCOVER_CATEGORY_LABEL_PATTERN =
@@ -1121,7 +1920,7 @@
       inviteButtonLabel: "",
       // Creator tab state. Kept alongside the invite state rather than in a
       // second store so one Clear/Copy/log surface serves both tabs.
-      activeTab: SITE === "youtube" ? "creators" : "servers",
+      activeTab: SITE === "discord" ? "servers" : "creators",
       creatorQuery: "",
       creatorPlatform: CREATOR_PLATFORM_DEFAULT,
       creatorUploadGapDays: YT_UPLOAD_GAP_DEFAULT_DAYS,
@@ -1145,12 +1944,12 @@
   }
 
   // The panel tab. Defaults to whichever tab the CURRENT SITE can actually run,
-  // so opening YouTube lands on Creators without a click and opening Discord
-  // lands on Servers.
+  // so opening YouTube or TikTok lands on Creators without a click and opening
+  // Discord lands on Servers.
   function getActiveTab() {
     const state = loadState();
     const stored = state.activeTab === "creators" || state.activeTab === "servers" ? state.activeTab : null;
-    return stored ?? (SITE === "youtube" ? "creators" : "servers");
+    return stored ?? (SITE === "discord" ? "servers" : "creators");
   }
 
   function setActiveTab(tab) {
@@ -1243,8 +2042,8 @@
   }
 
   // The creator platform in force. Anything unknown — or a platform whose
-  // collector has not been written yet — falls back to YouTube rather than
-  // leaving the tab pointed at something that cannot run.
+  // collector has not been written yet — falls back to this site's platform
+  // rather than leaving the tab pointed at something that cannot run.
   function getCreatorPlatform() {
     const stored = String(loadState().creatorPlatform || "");
     const match = CREATOR_PLATFORMS.find((entry) => entry.value === stored);
@@ -3972,7 +4771,7 @@
   function clearStaleRunningFlag() {
     const state = loadState();
     if (!state.running) return;
-    if (SITE === "youtube" || getActiveTab() === "creators") {
+    if (SITE !== "discord" || getActiveTab() === "creators") {
       state.running = false;
       state.statusText = "";
       saveState(state);
@@ -5037,7 +5836,7 @@
         saveState(creatorState);
         refreshUI();
         try {
-          await collectCreators(query);
+          await (platform.value === "tiktok" ? ttCollectCreators(query) : collectCreators(query));
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           logError(`ERROR: ${message}`, err);
@@ -5160,7 +5959,7 @@
   // Discord-only startup. The off-site click guard exists to stop a Discover
   // scan wandering out of Discord, and the resume path reattaches an interrupted
   // Discover flow — both drive the Discord DOM and would be, at best, inert on
-  // YouTube. The panel itself is shared; only this half is gated.
+  // YouTube or TikTok. The panel itself is shared; only this half is gated.
   if (SITE === "discord") {
     installOffSiteClickGuard();
     resumeDiscoverCollectionIfNeeded().catch((err) => {

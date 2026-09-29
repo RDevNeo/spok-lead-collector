@@ -4,8 +4,8 @@ Keep this file and `AGENTS.md` identical — they are the same rules for differe
 
 ## What this project is
 
-A single-file Tampermonkey userscript (`lead-collector.user.js`) that runs on Discord web
-and YouTube, collecting server invites and YouTube creator profiles. There is no build step, no bundler, no `package.json`, and no
+A single-file Tampermonkey userscript (`lead-collector.user.js`) that runs on Discord web,
+YouTube and TikTok, collecting server invites and YouTube / TikTok creator profiles. There is no build step, no bundler, no `package.json`, and no
 dependencies. The file you edit is byte-for-byte the file users install.
 
 Two consequences that constrain every change:
