@@ -5,15 +5,15 @@
 // @description  Collect Discord server invites, and YouTube creator profiles, into SpokPayCRM.
 // @author       RDevNeo
 // @license      MIT
-// @homepageURL  https://github.com/RDevNeo/lead-collector
-// @supportURL   https://github.com/RDevNeo/lead-collector/issues
+// @homepageURL  https://github.com/RDevNeo/spok-lead-collector
+// @supportURL   https://github.com/RDevNeo/spok-lead-collector/issues
 // @match        https://discord.com/*
 // @match        https://*.discord.com/*
 // @match        https://www.youtube.com/*
 // @match        https://m.youtube.com/*
 // @grant        none
-// @updateURL    https://raw.githubusercontent.com/RDevNeo/lead-collector/main/lead-collector.user.js
-// @downloadURL  https://raw.githubusercontent.com/RDevNeo/lead-collector/main/lead-collector.user.js
+// @updateURL    https://raw.githubusercontent.com/RDevNeo/spok-lead-collector/main/lead-collector.user.js
+// @downloadURL  https://raw.githubusercontent.com/RDevNeo/spok-lead-collector/main/lead-collector.user.js
 // @run-at       document-idle
 // ==/UserScript==
 

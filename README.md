@@ -14,7 +14,7 @@ CRM is fed by pasting, never by an automatic import.
 
 1. Install the [Tampermonkey](https://www.tampermonkey.net/) browser extension.
 2. Click
-   **[install the script](https://raw.githubusercontent.com/RDevNeo/lead-collector/main/lead-collector.user.js)**
+   **[install the script](https://raw.githubusercontent.com/RDevNeo/spok-lead-collector/main/lead-collector.user.js)**
    — Tampermonkey recognizes the `// ==UserScript==` header and opens its install prompt. (Installing
    from this URL is what registers the auto-update source; a copy-pasted script never updates itself.)
 3. Open Discord web (`https://discord.com/*`) or YouTube (`https://www.youtube.com/*`) — the

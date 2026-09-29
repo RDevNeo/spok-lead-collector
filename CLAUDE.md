@@ -15,6 +15,9 @@ Two consequences that constrain every change:
   because there is no build step to read them.
 - **The metadata header is parsed statically.** `@updateURL`, `@downloadURL`, `@match`, `@namespace`
   etc. are read by Tampermonkey before any JavaScript runs, so they can never be computed at runtime.
+- **`@namespace` deliberately still names the old repo** (`RDevNeo/lead-collector`, since renamed to
+  `RDevNeo/spok-lead-collector`). It is an identity, not a link: Tampermonkey keys a script on
+  `@name` + `@namespace`, so "fixing" it would orphan every installed copy. Leave it.
 
 ## Versioning — do not edit by hand
 
@@ -43,7 +46,7 @@ explicitly and in full:
 Always include the install URL literally so it can be clicked:
 
 ```
-https://raw.githubusercontent.com/RDevNeo/lead-collector/main/lead-collector.user.js
+https://raw.githubusercontent.com/RDevNeo/spok-lead-collector/main/lead-collector.user.js
 ```
 
 If a change altered `@name` or `@namespace`, say plainly that this one needs a manual reinstall — do
