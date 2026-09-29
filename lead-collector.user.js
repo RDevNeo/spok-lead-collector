@@ -3989,28 +3989,43 @@
       `
       <style>
         /* Panel-scoped design tokens. Everything is namespaced under #dic-panel and
-           --dic-*, so nothing here can leak into Discord's own styles. */
+           --dic-*, so nothing here can leak into Discord's own styles.
+
+           The system is rengaf (Geist-modeled), dark theme, translated to plain
+           CSS since there is no build step to run Tailwind. Its rules, kept here:
+             - Color comes only from the scales below, picked by step: 100-300
+               component backgrounds, 400-600 borders, 700-800 solid fills,
+               900-1000 text. background-100 is every element, background-200
+               the well (the log body).
+             - Type is one preset per element (heading / label / copy / button),
+               never size + weight composed by hand. Nothing under 12px.
+             - Radius 6px for controls, 8px for cards, 12px for the floating
+               panel, full for dots and badges.
+             - Only the panel floats, so only the panel has a shadow. */
         #dic-panel {
-          --dic-radius: 0.75rem;
-          --dic-radius-sm: calc(var(--dic-radius) - 4px);
-          --dic-radius-lg: calc(var(--dic-radius) + 4px);
-          --dic-background: oklch(0.14 0.01 280);
-          --dic-foreground: oklch(0.97 0.005 280);
-          --dic-card: oklch(0.18 0.015 280);
-          --dic-primary: oklch(0.55 0.25 295);
-          --dic-primary-foreground: oklch(0.98 0.005 280);
-          --dic-secondary: oklch(0.24 0.02 280);
-          --dic-muted: oklch(0.22 0.015 280);
-          --dic-muted-foreground: oklch(0.7 0.02 280);
-          --dic-accent: oklch(0.32 0.1 295);
-          --dic-destructive: oklch(0.62 0.22 27);
-          --dic-success: oklch(0.7 0.16 150);
-          --dic-border: oklch(1 0 0 / 0.08);
-          --dic-input: oklch(1 0 0 / 0.12);
-          --dic-ring: oklch(0.55 0.25 295);
-          --dic-gradient-brand: linear-gradient(135deg, oklch(0.6 0.25 295), oklch(0.7 0.18 250));
-          --dic-shadow-card: 0 1px 2px oklch(0 0 0 / 0.2), 0 4px 16px oklch(0 0 0 / 0.35);
-          --dic-shadow-card-hover: 0 2px 4px oklch(0 0 0 / 0.25), 0 12px 28px oklch(0 0 0 / 0.5);
+          --dic-background-100: #0a0a0a;
+          --dic-background-200: #111;
+          --dic-gray-100: #1a1a1a;
+          --dic-gray-200: #1f1f1f;
+          --dic-gray-400: #2e2e2e;
+          --dic-gray-500: #454545;
+          --dic-gray-600: #878787;
+          --dic-gray-900: #a0a0a0;
+          --dic-gray-1000: #ededed;
+          --dic-red-800: #da3036;
+          --dic-amber-800: #ff990a;
+          --dic-green-800: #398e4a;
+
+          --dic-radius-md: 6px;
+          --dic-radius-lg: 8px;
+          --dic-radius-xl: 12px;
+
+          --dic-ring: color-mix(in srgb, var(--dic-gray-1000) 50%, transparent);
+          --dic-shadow-small: 0px 1px 2px #00000029;
+          --dic-shadow-modal: 0 0 0 1px #ffffff25, 0px 1px 1px #00000005, 0px 8px 16px -4px #0000000a, 0px 24px 32px -8px #0000000f;
+
+          --dic-font-sans: Geist, "Geist Sans", ui-sans-serif, system-ui, sans-serif;
+          --dic-font-mono: "Geist Mono", ui-monospace, SFMono-Regular, Consolas, monospace;
 
           position: fixed;
           top: 12px;
@@ -4019,13 +4034,18 @@
           z-index: 99999;
           width: 460px;
           max-width: calc(100vw - 24px);
-          background: var(--dic-background);
-          border: 1px solid var(--dic-border);
-          border-radius: var(--dic-radius-lg);
-          color: var(--dic-foreground);
-          font-family: Sora, 'gg sans', ui-sans-serif, system-ui, sans-serif;
-          font-size: 13px;
-          box-shadow: var(--dic-shadow-card);
+          background: var(--dic-background-100);
+          border: 1px solid var(--dic-gray-400);
+          border-radius: var(--dic-radius-xl);
+          color: var(--dic-gray-1000);
+          color-scheme: dark;
+          font-family: var(--dic-font-sans);
+          font-feature-settings: "cv11", "ss01";
+          /* text-label-14 */
+          font-size: 14px;
+          line-height: 20px;
+          font-weight: 400;
+          box-shadow: var(--dic-shadow-modal);
         }
         #dic-panel *,
         #dic-panel *::before,
@@ -4033,13 +4053,14 @@
           box-sizing: border-box;
         }
         #dic-header {
-          padding: 10px 14px 10px 12px;
-          background: var(--dic-card);
-          border-radius: var(--dic-radius-lg) var(--dic-radius-lg) 0 0;
+          padding: 8px 16px;
+          background: var(--dic-background-100);
+          border-radius: var(--dic-radius-xl) var(--dic-radius-xl) 0 0;
           display: flex;
           justify-content: space-between;
           align-items: center;
-          border-bottom: 1px solid var(--dic-border);
+          gap: 8px;
+          border-bottom: 1px solid var(--dic-gray-400);
           cursor: grab;
         }
         #dic-title {
@@ -4049,9 +4070,14 @@
           min-width: 0;
         }
         #dic-title span {
+          /* text-heading-14 */
+          font-size: 14px;
+          line-height: 20px;
+          letter-spacing: -0.02em;
           font-weight: 600;
-          font-size: 13px;
-          letter-spacing: -0.01em;
+          white-space: nowrap;
+          overflow: hidden;
+          text-overflow: ellipsis;
         }
         #dic-header-meta {
           display: flex;
@@ -4059,29 +4085,33 @@
           gap: 8px;
           flex: 0 0 auto;
         }
+        /* Badge, muted tone. */
         #dic-version {
-          font-size: 10px;
-          font-weight: 600;
-          letter-spacing: .04em;
-          color: var(--dic-muted-foreground);
-          background: var(--dic-muted);
-          border: 1px solid var(--dic-border);
+          display: inline-flex;
+          align-items: center;
+          padding: 2px 8px;
+          border: 1px solid transparent;
           border-radius: 9999px;
-          padding: 3px 8px;
-          line-height: 1;
+          background: var(--dic-gray-100);
+          color: var(--dic-gray-900);
+          /* text-label-12-mono */
+          font-family: var(--dic-font-mono);
+          font-size: 12px;
+          line-height: 16px;
+          font-weight: 400;
+          font-variant-numeric: tabular-nums;
+          white-space: nowrap;
         }
         .dic-indicator {
-          width: 10px;
-          height: 10px;
+          width: 8px;
+          height: 8px;
           border-radius: 9999px;
-          background: var(--dic-muted-foreground);
-          opacity: .5;
+          background: var(--dic-gray-600);
           flex: none;
+          transition: background-color .15s ease;
         }
         .dic-indicator.is-running {
-          background: var(--dic-success);
-          opacity: 1;
-          box-shadow: 0 0 8px color-mix(in oklab, var(--dic-success) 70%, transparent);
+          background: var(--dic-green-800);
         }
         #dic-traffic {
           display: flex;
@@ -4092,72 +4122,89 @@
           width: 12px;
           height: 12px;
           border-radius: 9999px;
-          border: 1px solid var(--dic-border);
-          box-shadow: inset 0 1px 0 oklch(1 0 0 / 0.14);
+          border: 1px solid var(--dic-gray-400);
           cursor: pointer;
           padding: 0;
           display: inline-block;
+          outline: none;
+          transition: filter .15s ease;
         }
-        .dic-light.yellow { background: oklch(0.78 0.16 75); }
-        .dic-light.green { background: var(--dic-success); }
+        .dic-light:hover {
+          filter: brightness(1.15);
+        }
+        .dic-light:focus-visible {
+          box-shadow: 0 0 0 3px var(--dic-ring);
+        }
+        .dic-light.yellow { background: var(--dic-amber-800); }
+        .dic-light.green { background: var(--dic-green-800); }
+        /* One column, 16px between blocks. Rows hidden with display:none drop
+           out of the gap on their own, so no row carries its own margin. */
         #dic-body {
-          padding: 12px;
+          padding: 16px;
+          display: flex;
+          flex-direction: column;
+          gap: 16px;
         }
+        /* Tabs: a muted track with the active trigger raised on it. */
         #dic-tabs {
           display: flex;
-          gap: 4px;
-          padding: 4px;
-          margin-bottom: 10px;
-          border: 1px solid rgba(255, 255, 255, 0.06);
-          border-radius: 10px;
-          background: rgba(255, 255, 255, 0.03);
+          align-items: center;
+          height: 36px;
+          padding: 3px;
+          border-radius: var(--dic-radius-lg);
+          background: var(--dic-gray-100);
         }
         .dic-tab {
           flex: 1;
+          height: 100%;
           display: inline-flex;
           align-items: center;
           justify-content: center;
           gap: 6px;
-          padding: 6px 10px;
+          padding: 4px 8px;
           border: 1px solid transparent;
-          border-radius: 7px;
+          border-radius: var(--dic-radius-md);
           background: transparent;
-          color: rgba(255, 255, 255, 0.5);
-          font: inherit;
-          font-size: 12px;
+          color: var(--dic-gray-900);
+          font-family: inherit;
+          /* text-button-14 */
+          font-size: 14px;
+          line-height: 20px;
           font-weight: 500;
+          white-space: nowrap;
           cursor: pointer;
-          transition: background 120ms ease, color 120ms ease;
+          outline: none;
+          transition: color .15s ease, background-color .15s ease, box-shadow .15s ease;
         }
         .dic-tab:hover {
-          color: rgba(255, 255, 255, 0.8);
+          color: var(--dic-gray-1000);
+        }
+        .dic-tab:focus-visible {
+          border-color: var(--dic-gray-1000);
+          box-shadow: 0 0 0 3px var(--dic-ring);
         }
         .dic-tab.active {
-          border-color: rgba(255, 255, 255, 0.1);
-          background: rgba(255, 255, 255, 0.08);
-          color: #fff;
+          border-color: var(--dic-gray-400);
+          background: color-mix(in srgb, var(--dic-gray-400) 30%, transparent);
+          color: var(--dic-gray-1000);
+          box-shadow: var(--dic-shadow-small);
         }
         .dic-tab svg {
-          width: 14px;
-          height: 14px;
+          width: 16px;
+          height: 16px;
+          flex: none;
         }
+        /* Note: the tab cannot run on this site. */
         #dic-site-hint {
-          margin-bottom: 10px;
-          padding: 8px 10px;
-          border: 1px dashed rgba(255, 255, 255, 0.12);
-          border-radius: 8px;
-          color: rgba(255, 255, 255, 0.5);
-          font-size: 11px;
-          line-height: 1.45;
-        }
-        #dic-target-row,
-        #dic-creator-row,
-        #dic-creator-source-row,
-        #dic-upload-gap-row,
-        #dic-mode-row,
-        #dic-discover-row,
-        #dic-discover-language-row {
-          margin-bottom: 10px;
+          padding: 8px 16px;
+          border: 1px solid var(--dic-gray-400);
+          border-radius: var(--dic-radius-lg);
+          background: var(--dic-background-200);
+          color: var(--dic-gray-900);
+          /* text-copy-13 */
+          font-size: 13px;
+          line-height: 18px;
+          font-weight: 400;
         }
         #dic-target-label,
         #dic-creator-label,
@@ -4167,10 +4214,12 @@
         #dic-discover-label,
         #dic-discover-language-label {
           display: block;
-          font-size: 11px;
-          font-weight: 600;
-          color: var(--dic-muted-foreground);
-          margin-bottom: 5px;
+          margin-bottom: 8px;
+          color: var(--dic-gray-900);
+          /* text-label-13 */
+          font-size: 13px;
+          line-height: 16px;
+          font-weight: 400;
         }
         #dic-mode,
         #dic-creator-source,
@@ -4179,52 +4228,83 @@
         #dic-creator-query,
         #dic-discover-query {
           width: 100%;
-          border: 1px solid var(--dic-input);
-          border-radius: var(--dic-radius-sm);
-          background: var(--dic-card);
-          color: var(--dic-foreground);
-          padding: 8px 10px;
+          height: 36px;
+          margin: 0;
+          border: 1px solid var(--dic-gray-400);
+          border-radius: var(--dic-radius-md);
+          background: var(--dic-background-100);
+          color: var(--dic-gray-1000);
+          padding: 0 12px;
           font-family: inherit;
-          font-size: 12px;
+          /* text-label-14 */
+          font-size: 14px;
+          line-height: 20px;
+          font-weight: 400;
+          box-shadow: var(--dic-shadow-small);
           outline: none;
-          transition: border-color .15s ease, box-shadow .15s ease;
+          transition: border-color .15s ease, box-shadow .15s ease, background-color .15s ease;
         }
-        #dic-mode:focus,
-        #dic-creator-source:focus,
-        #dic-upload-gap:focus,
-        #dic-discover-language:focus,
+        #dic-mode,
+        #dic-creator-source,
+        #dic-upload-gap,
+        #dic-discover-language {
+          cursor: pointer;
+        }
+        #dic-mode:hover:not(:disabled),
+        #dic-creator-source:hover:not(:disabled),
+        #dic-upload-gap:hover:not(:disabled),
+        #dic-discover-language:hover:not(:disabled) {
+          background: var(--dic-gray-200);
+        }
+        #dic-mode:focus-visible,
+        #dic-creator-source:focus-visible,
+        #dic-upload-gap:focus-visible,
+        #dic-discover-language:focus-visible,
         #dic-creator-query:focus,
         #dic-discover-query:focus {
-          border-color: var(--dic-ring);
-          box-shadow: 0 0 0 3px color-mix(in oklab, var(--dic-ring) 25%, transparent);
+          border-color: var(--dic-gray-1000);
+          box-shadow: 0 0 0 3px var(--dic-ring);
+        }
+        /* The native option list ignores most of the select's styling but does
+           read these, so it opens dark instead of in the OS light theme. */
+        #dic-panel option {
+          background: var(--dic-background-100);
+          color: var(--dic-gray-1000);
+        }
+        #dic-panel option:disabled {
+          color: var(--dic-gray-600);
         }
         #dic-creator-source:disabled,
         #dic-upload-gap:disabled,
         #dic-creator-query:disabled {
           opacity: .5;
-          cursor: default;
+          cursor: not-allowed;
         }
         #dic-creator-query::placeholder,
         #dic-discover-query::placeholder {
-          color: var(--dic-muted-foreground);
+          color: var(--dic-gray-900);
         }
         /* Target is a composed control, not a bare input: the native number
            spinner renders as a light-themed widget the panel's palette cannot
            reach, so the value, its unit and a pair of steppers share one framed
-           row and the input itself is a plain text field. */
+           row and the input itself is a plain text field. The frame is the
+           Input recipe; the steppers are extra-small ghost icon buttons sized
+           to sit inside its 36px. */
         #dic-target-control {
           display: flex;
           align-items: center;
           gap: 8px;
-          padding: 4px 4px 4px 10px;
-          border: 1px solid var(--dic-input);
-          border-radius: var(--dic-radius-sm);
-          background: var(--dic-card);
+          height: 36px;
+          padding: 3px 3px 3px 12px;
+          border: 1px solid var(--dic-gray-400);
+          border-radius: var(--dic-radius-md);
+          background: var(--dic-background-100);
+          box-shadow: var(--dic-shadow-small);
           transition: border-color .15s ease, box-shadow .15s ease, opacity .15s ease;
         }
         #dic-target-control:focus-within {
-          border-color: var(--dic-ring);
-          box-shadow: 0 0 0 3px color-mix(in oklab, var(--dic-ring) 25%, transparent);
+          border-color: var(--dic-gray-1000);
+          box-shadow: 0 0 0 3px var(--dic-ring);
         }
         #dic-target-control.is-disabled {
           opacity: .5;
@@ -4232,25 +4312,30 @@
         #dic-target {
           flex: 1 1 auto;
           min-width: 0;
+          height: 100%;
+          margin: 0;
           border: 0;
           background: transparent;
-          color: var(--dic-foreground);
+          color: var(--dic-gray-1000);
+          padding: 0;
           font-family: inherit;
-          font-size: 13px;
-          font-weight: 600;
+          /* text-label-14, tabular */
+          font-size: 14px;
+          line-height: 20px;
+          font-weight: 400;
           font-variant-numeric: tabular-nums;
-          padding: 4px 0;
           outline: none;
         }
         #dic-target::placeholder {
-          color: var(--dic-muted-foreground);
-          font-size: 12px;
-          font-weight: 500;
+          color: var(--dic-gray-900);
         }
         #dic-target-unit {
           flex: 0 0 auto;
-          font-size: 11px;
-          color: var(--dic-muted-foreground);
+          color: var(--dic-gray-900);
+          /* text-label-13 */
+          font-size: 13px;
+          line-height: 16px;
+          font-weight: 400;
           white-space: nowrap;
         }
         #dic-target-steps {
@@ -4259,107 +4344,143 @@
           gap: 2px;
         }
         .dic-target-step {
-          width: 24px;
-          height: 24px;
+          width: 28px;
+          height: 28px;
           display: inline-flex;
           align-items: center;
           justify-content: center;
-          border: 1px solid var(--dic-border);
-          border-radius: 7px;
-          background: var(--dic-secondary);
-          color: var(--dic-muted-foreground);
+          padding: 0;
+          border: 1px solid transparent;
+          border-radius: var(--dic-radius-md);
+          background: transparent;
+          color: var(--dic-gray-900);
           font-family: inherit;
-          font-size: 13px;
-          font-weight: 600;
-          line-height: 1;
+          /* text-button-14 */
+          font-size: 14px;
+          line-height: 20px;
+          font-weight: 500;
           cursor: pointer;
-          transition: filter .15s ease, color .15s ease;
+          outline: none;
+          transition: color .15s ease, background-color .15s ease, box-shadow .15s ease;
         }
         .dic-target-step:hover:not(:disabled) {
-          filter: brightness(1.2);
-          color: var(--dic-foreground);
+          background: color-mix(in srgb, var(--dic-gray-200) 50%, transparent);
+          color: var(--dic-gray-1000);
         }
         .dic-target-step:focus-visible {
-          outline: none;
-          box-shadow: 0 0 0 3px color-mix(in oklab, var(--dic-ring) 35%, transparent);
+          border-color: var(--dic-gray-1000);
+          box-shadow: 0 0 0 3px var(--dic-ring);
         }
         .dic-target-step:disabled {
-          opacity: .4;
-          cursor: default;
+          opacity: .5;
+          cursor: not-allowed;
         }
         #dic-target-hint {
-          margin-top: 5px;
-          font-size: 10px;
-          line-height: 1.4;
-          color: var(--dic-muted-foreground);
+          margin-top: 8px;
+          color: var(--dic-gray-900);
+          /* text-label-13 */
+          font-size: 13px;
+          line-height: 16px;
+          font-weight: 400;
+        }
+        #dic-target-hint:empty {
+          display: none;
         }
         #dic-actions {
           display: flex;
-          gap: 6px;
+          gap: 8px;
           flex-wrap: wrap;
         }
+        /* Button recipe. Variants below: default (Start, the one primary
+           action), outline (Pause), ghost-muted (toolbar actions) and
+           ghost-destructive (Clear list, which throws away collected leads). */
         .dic-btn {
           flex: 0 0 auto;
-          padding: 6px 12px;
-          border: 1px solid transparent;
-          border-radius: 9999px;
-          background: var(--dic-secondary);
-          color: var(--dic-foreground);
-          font-family: inherit;
-          font-size: 11px;
-          font-weight: 600;
-          cursor: pointer;
-          line-height: 1;
-          transition: filter .15s ease, opacity .15s ease;
-        }
-        .dic-btn:hover:not(:disabled) {
-          filter: brightness(1.15);
-        }
-        .dic-btn:focus-visible {
-          outline: none;
-          box-shadow: 0 0 0 3px color-mix(in oklab, var(--dic-ring) 35%, transparent);
-        }
-        .dic-icon-btn {
-          width: 30px;
-          min-width: 30px;
-          height: 30px;
-          padding: 0;
           display: inline-flex;
           align-items: center;
           justify-content: center;
+          gap: 8px;
+          height: 32px;
+          padding: 0 12px;
+          border: 1px solid transparent;
+          border-radius: var(--dic-radius-md);
+          background: transparent;
+          color: var(--dic-gray-1000);
+          font-family: inherit;
+          /* text-button-14 */
+          font-size: 14px;
+          line-height: 20px;
+          font-weight: 500;
+          white-space: nowrap;
+          cursor: pointer;
+          outline: none;
+          transition: color .15s ease, background-color .15s ease, border-color .15s ease, box-shadow .15s ease, opacity .15s ease;
+        }
+        .dic-btn:focus-visible {
+          border-color: var(--dic-gray-1000);
+          box-shadow: 0 0 0 3px var(--dic-ring);
+        }
+        .dic-btn:disabled {
+          opacity: .5;
+          cursor: default;
+          pointer-events: none;
+        }
+        .dic-icon-btn {
+          width: 32px;
+          min-width: 32px;
+          padding: 0;
         }
         .dic-icon-btn svg {
-          width: 14px;
-          height: 14px;
+          width: 16px;
+          height: 16px;
           display: block;
           color: currentColor;
           flex: none;
-        }
-        .dic-btn:disabled {
-          opacity: .4;
-          cursor: default;
+          pointer-events: none;
         }
         #dic-start {
-          background: var(--dic-primary);
-          color: var(--dic-primary-foreground);
+          background: var(--dic-gray-1000);
+          color: var(--dic-background-100);
+        }
+        #dic-start:hover:not(:disabled) {
+          background: color-mix(in srgb, var(--dic-gray-1000) 90%, transparent);
         }
         #dic-stop {
-          background: var(--dic-destructive);
-          color: var(--dic-primary-foreground);
+          border-color: var(--dic-gray-400);
+          background: color-mix(in srgb, var(--dic-gray-400) 30%, transparent);
+          box-shadow: var(--dic-shadow-small);
+        }
+        #dic-stop:hover:not(:disabled) {
+          background: color-mix(in srgb, var(--dic-gray-400) 50%, transparent);
         }
         #dic-copy,
-        #dic-clear-invites,
         #dic-clear-log,
         #dic-copy-log {
-          background: var(--dic-secondary);
-          border-color: var(--dic-border);
-          color: var(--dic-muted-foreground);
+          color: var(--dic-gray-900);
         }
         #dic-copy:hover:not(:disabled),
-        #dic-clear-invites:hover:not(:disabled),
         #dic-clear-log:hover:not(:disabled),
         #dic-copy-log:hover:not(:disabled) {
-          color: var(--dic-foreground);
+          background: color-mix(in srgb, var(--dic-gray-200) 50%, transparent);
+          color: var(--dic-gray-1000);
+        }
+        #dic-clear-invites {
+          color: var(--dic-red-800);
+        }
+        #dic-clear-invites:hover:not(:disabled) {
+          background: color-mix(in srgb, var(--dic-red-800) 20%, transparent);
+        }
+        /* Log toolbar buttons are the extra-small size: dense toolbar. */
+        #dic-clear-log,
+        #dic-copy-log {
+          width: 28px;
+          min-width: 28px;
+          height: 28px;
+        }
+        #dic-clear-log svg,
+        #dic-copy-log svg {
+          width: 14px;
+          height: 14px;
         }
         .dic-sr-only {
           position: absolute;
@@ -4375,110 +4496,103 @@
         #dic-status {
           display: none;
         }
-        #dic-stats-card {
-          margin-top: 10px;
-        }
+        /* StatGroup: one bordered box divided into cells. The 1px gap over a
+           gray-400 track draws the dividers, so a hidden cell leaves no stray
+           line behind. */
         #dic-stats-grid {
           display: grid;
-          grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
-          gap: 8px;
-        }
-        .dic-stat {
-          position: relative;
-          min-width: 0;
-          padding: 10px 12px 10px 14px;
-          border-radius: var(--dic-radius);
-          border: 1px solid var(--dic-border);
-          background: var(--dic-card);
-          box-shadow: var(--dic-shadow-card);
-          display: flex;
-          align-items: center;
-          justify-content: space-between;
-          gap: 8px;
-          text-align: left;
+          grid-auto-flow: column;
+          grid-auto-columns: minmax(0, 1fr);
+          gap: 1px;
+          border: 1px solid var(--dic-gray-400);
+          border-radius: var(--dic-radius-lg);
+          background: var(--dic-gray-400);
           overflow: hidden;
         }
-        .dic-stat::before {
-          content: "";
-          position: absolute;
-          inset: 0 auto 0 0;
-          width: 3px;
-          background: var(--dic-gradient-brand);
+        .dic-stat {
+          min-width: 0;
+          padding: 16px 24px;
+          background: var(--dic-background-100);
         }
         .dic-stat-label {
           display: block;
-          font-size: 9px;
-          font-weight: 600;
-          letter-spacing: 0.08em;
-          text-transform: uppercase;
-          color: var(--dic-muted-foreground);
           min-width: 0;
+          color: var(--dic-gray-900);
+          /* text-label-13 */
+          font-size: 13px;
+          line-height: 16px;
+          font-weight: 400;
           overflow: hidden;
           text-overflow: ellipsis;
           white-space: nowrap;
         }
         .dic-stat-value {
           display: block;
-          min-width: 4ch;
-          font-size: clamp(12px, 3.5vw, 17px);
-          line-height: 1;
-          font-weight: 700;
-          color: var(--dic-foreground);
-          text-align: right;
-          flex: none;
+          margin-top: 4px;
+          color: var(--dic-gray-1000);
+          /* text-heading-24, tabular */
+          font-size: 24px;
+          line-height: 32px;
+          letter-spacing: -0.04em;
+          font-weight: 600;
           font-variant-numeric: tabular-nums;
-          font-feature-settings: "tnum";
-          letter-spacing: -0.02em;
           white-space: nowrap;
+          overflow: hidden;
+          text-overflow: ellipsis;
         }
+        /* Panel: a card with a header row over a well. */
         #dic-log-card {
-          margin-top: 10px;
-          background: var(--dic-card);
-          border: 1px solid var(--dic-border);
-          border-radius: var(--dic-radius);
+          background: var(--dic-background-100);
+          border: 1px solid var(--dic-gray-400);
+          border-radius: var(--dic-radius-lg);
           overflow: hidden;
         }
         #dic-log-head {
           display: flex;
           align-items: center;
           justify-content: space-between;
-          gap: 6px;
-          padding: 8px 10px;
-          border-bottom: 1px solid var(--dic-border);
-          background: var(--dic-muted);
+          gap: 8px;
+          padding: 8px 8px 8px 16px;
         }
         #dic-log-label {
           display: flex;
           align-items: center;
-          gap: 7px;
+          gap: 8px;
           min-width: 0;
-          font-size: 11px;
+          color: var(--dic-gray-1000);
+          /* text-heading-14 */
+          font-size: 14px;
+          line-height: 20px;
+          letter-spacing: -0.02em;
           font-weight: 600;
-          letter-spacing: 0.04em;
-          text-transform: uppercase;
-          color: var(--dic-muted-foreground);
         }
         #dic-log-label svg {
-          width: 14px;
-          height: 14px;
+          width: 16px;
+          height: 16px;
           flex: none;
+          color: var(--dic-gray-900);
         }
         #dic-log-tools {
           display: flex;
           justify-content: flex-end;
-          gap: 6px;
+          gap: 4px;
         }
         #dic-log {
-          padding: 8px 10px 10px;
+          padding: 8px 16px 16px;
           max-height: 220px;
           overflow-y: auto;
-          font-size: 12px;
-          font-family: ui-monospace, Consolas, monospace;
-          color: var(--dic-muted-foreground);
+          border-top: 1px solid var(--dic-gray-400);
+          background: var(--dic-background-200);
+          color: var(--dic-gray-900);
+          /* text-copy-13-mono */
+          font-family: var(--dic-font-mono);
+          font-size: 13px;
+          line-height: 18px;
+          font-weight: 400;
           white-space: pre-wrap;
           word-break: break-word;
           scrollbar-width: thin;
-          scrollbar-color: color-mix(in oklab, var(--dic-muted-foreground) 35%, transparent) transparent;
+          scrollbar-color: var(--dic-gray-500) transparent;
         }
         #dic-log::-webkit-scrollbar {
           width: 6px;
@@ -4488,11 +4602,11 @@
           background: transparent;
         }
         #dic-log::-webkit-scrollbar-thumb {
-          background-color: color-mix(in oklab, var(--dic-muted-foreground) 30%, transparent);
+          background-color: var(--dic-gray-500);
           border-radius: 9999px;
         }
         #dic-log::-webkit-scrollbar-thumb:hover {
-          background-color: color-mix(in oklab, var(--dic-muted-foreground) 55%, transparent);
+          background-color: var(--dic-gray-600);
         }
         @media (max-width: 420px) {
           #dic-panel {
@@ -4500,7 +4614,7 @@
             top: 8px;
           }
           #dic-stats-grid {
-            grid-template-columns: 1fr;
+            grid-auto-flow: row;
           }
         }
       </style>
