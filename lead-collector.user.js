@@ -1724,6 +1724,8 @@
   // given up, and how long its video grid gets to appear.
   const TT_VISIT_TIMEOUT_MS = 20000;
   const TT_GRID_WAIT_MS = 8000;
+  // How long the grid's posters and view counts get to arrive after its links.
+  const TT_CARD_FILL_WAIT_MS = 8000;
   // How long the sweep waits on a verification puzzle for the operator to
   // solve it.
   const TT_PUZZLE_WAIT_MS = 180000;
@@ -1759,17 +1761,56 @@
     return Boolean(match && decodeURIComponent(match[1]).toLowerCase() === uniqueId.toLowerCase());
   }
 
-  // Ids of this account's videos linked on the page. Only links to THIS handle
-  // count: a profile also shows other accounts' videos.
-  function ttVideoIdsOnPage(uniqueId) {
+  // TikTok writes each grid card's alt text as "<description> created by
+  // <name> with <sound>". The description is the part worth keeping, but the
+  // words joining it to the rest are localized — there is no language-proof
+  // place to cut — so the whole thing is kept rather than risk cutting a
+  // description short for anyone not reading TikTok in English. Whitespace is
+  // normalized and the length bounded, since this travels into the CRM.
+  const TT_TITLE_MAX = 300;
+
+  // The card's poster. TikTok paints a 1x1 data: GIF into `src` until the real
+  // image loads, so that placeholder must not be stored as a thumbnail;
+  // `srcset` already carries the real URL while `src` is still the placeholder.
+  function ttPosterUrl(image) {
+    if (!image) return null;
+    const src = image.getAttribute("src") || "";
+    if (src && !src.startsWith("data:")) return src;
+    const first = (image.getAttribute("srcset") || "").split(",")[0].trim().split(/\s+/)[0];
+    return first && !first.startsWith("data:") ? first : null;
+  }
+
+  function ttTitleFromAlt(alt) {
+    const text = String(alt || "").replace(/\s+/g, " ").trim();
+    return text ? text.slice(0, TT_TITLE_MAX) : null;
+  }
+
+  // This account's videos as the page shows them: the id from the link, and the
+  // poster, view count and description the card displays next to it. A visited
+  // profile is the ONLY place these are readable — the video-list API answers an
+  // empty body even signed in — so a record's videos are as good as this card.
+  // Only links to THIS handle count: a profile also shows other accounts' videos.
+  function ttVideosOnPage(uniqueId) {
     const handle = uniqueId.toLowerCase();
-    const ids = new Set();
+    const found = new Map();
     for (const anchor of document.querySelectorAll('a[href*="/video/"]')) {
       if (anchor.closest("#dic-panel")) continue;
       const match = (anchor.getAttribute("href") || "").match(/\/@([\w.]+)\/video\/(\d+)/);
-      if (match && match[1].toLowerCase() === handle) ids.add(match[2]);
+      if (!match || match[1].toLowerCase() !== handle) continue;
+
+      const card = anchor.closest('[data-e2e="user-post-item"]') || anchor.parentElement;
+      const image = card && card.querySelector("img");
+      const views = card && card.querySelector('[data-e2e="video-views"]');
+      found.set(match[2], {
+        id: match[2],
+        title: ttTitleFromAlt(image && image.getAttribute("alt")),
+        thumbnailUrl: ttPosterUrl(image),
+        // Shown abbreviated ("669.7K"); ytParseCount already reads that form in
+        // whatever grouping the reader's locale uses.
+        viewCount: views ? ytParseCount(views.textContent) : null,
+      });
     }
-    return [...ids];
+    return [...found.values()];
   }
 
   // TikTok loads a profile's grid lazily. Scrolling the tab list into view is
@@ -1784,15 +1825,38 @@
     else window.scrollBy(0, window.innerHeight);
   }
 
-  function ttVideoFromId(uniqueId, id) {
-    const time = ttTimeFromItemId(id);
+  // The cards that will survive ttNewestUploads' trim, picked the same way it
+  // picks them — by date. NOT the first few in the grid: TikTok pins videos to
+  // the top of a profile, so grid order and upload order are different lists,
+  // and waiting on the wrong ones stored the right videos with no posters.
+  function ttNewestCards(cards) {
+    return [...cards]
+      .sort((left, right) => (ttTimeFromItemId(right.id) || 0) - (ttTimeFromItemId(left.id) || 0))
+      .slice(0, YT_RECENT_VIDEO_LIMIT);
+  }
+
+  // A card's poster only loads once the card has been on screen, and the newest
+  // uploads are often NOT at the top — TikTok pins videos there, so the ones the
+  // record keeps can sit below the fold and never load at all. Bring each into
+  // view in turn, pausing long enough for the page to notice.
+  async function ttRevealCards(cards) {
+    for (const card of cards) {
+      const link = document.querySelector(`a[href*="/video/${card.id}"]`);
+      if (!link) continue;
+      link.scrollIntoView({ block: "center" });
+      await sleep(250);
+    }
+  }
+
+  function ttVideoFromGrid(uniqueId, video) {
+    const time = ttTimeFromItemId(video.id);
     return {
-      video_id: String(id),
-      title: null,
-      url: `${TT_ORIGIN}/@${uniqueId}/video/${id}`,
-      thumbnail_url: null,
+      video_id: String(video.id),
+      title: video.title,
+      url: `${TT_ORIGIN}/@${uniqueId}/video/${video.id}`,
+      thumbnail_url: video.thumbnailUrl,
       published_at: time ? new Date(time).toISOString() : null,
-      view_count: null,
+      view_count: video.viewCount,
     };
   }
 
@@ -1819,6 +1883,11 @@
       await sleep(500);
     }
 
+    // Whether the VISIT itself carried the profile. A fallback read still
+    // produces a record, but a thinner one - rounded followers, no video count,
+    // no bio link - and the page it came from had no video grid either, so the
+    // record has no videos. Worth another visit before settling for it.
+    const fellBack = !detail;
     let profile;
     if (detail) {
       profile = ttProfileFromDetail(detail);
@@ -1841,29 +1910,41 @@
     // discovery had already dated - and for EVERY account under "Any time",
     // which asks for no dates at all. An account whose profile says it has no
     // videos is the one case with nothing to wait for.
-    let ids = [];
+    let cards = [];
     if (profile.videos !== 0) {
       const readGrid = () =>
         waitFor(() => {
-          const found = ttVideoIdsOnPage(entry.uniqueId);
+          const found = ttVideosOnPage(entry.uniqueId);
           return found.length ? found : null;
         }, TT_GRID_WAIT_MS, 400);
 
-      ids = (await readGrid()) || [];
-      if (!ids.length) {
+      cards = (await readGrid()) || [];
+      if (!cards.length) {
         // TikTok fills the grid lazily, so bring it into view - what a reader
         // would do - and give it one more go before giving up on the account.
         ttScrollGridIntoView();
-        ids = (await readGrid()) || [];
+        cards = (await readGrid()) || [];
       }
-      if (ids.length) {
-        // The grid fills in over a moment; read once more after it settles.
-        await sleep(800);
-        ids = [...new Set([...ids, ...ttVideoIdsOnPage(entry.uniqueId)])];
+      if (cards.length) {
+        // A card's link renders before the poster and view count that belong to
+        // it, so cards read the moment they appear are half empty - which is
+        // how records reached the CRM carrying a placeholder GIF and no views.
+        // Wait for the first card to be filled in, then read again and let the
+        // later read win. Bounded: an account whose posters never load still
+        // deserves the videos themselves.
+        await ttRevealCards(ttNewestCards(ttVideosOnPage(entry.uniqueId)));
+        await waitFor(() => {
+          const kept = ttNewestCards(ttVideosOnPage(entry.uniqueId));
+          const ready = kept.length && kept.every((c) => c.thumbnailUrl && c.viewCount !== null);
+          return ready ? true : null;
+        }, TT_CARD_FILL_WAIT_MS, 250);
+        const merged = new Map(cards.map((card) => [card.id, card]));
+        for (const card of ttVideosOnPage(entry.uniqueId)) merged.set(card.id, card);
+        cards = [...merged.values()];
       }
     }
-    const videos = ids.map((id) => ttVideoFromId(profile.uniqueId, id));
-    return { profile, uploads: ttNewestUploads(videos) };
+    const videos = cards.map((card) => ttVideoFromGrid(profile.uniqueId, card));
+    return { profile, uploads: ttNewestUploads(videos), fellBack };
   }
 
   // Cheap check before a visit: the creator embed. Returns "drop" for an
@@ -1926,6 +2007,15 @@
       log(`SKIP ${label}: ${err instanceof Error ? err.message : String(err)}`);
       return "done";
     }
+    // A page that gave up none of its own data is a page that did not load, and
+    // the record built from the fallbacks is missing both the counts and the
+    // videos. Open it once more before accepting that.
+    if (visit.fellBack && !entry.reread) {
+      entry.reread = true;
+      log(`RETRY ${label}: the profile page showed no data of its own - opening it again.`);
+      return "retry";
+    }
+
     const { profile, uploads } = visit;
     const recentVideos = uploads.videos.length ? uploads.videos : entry.embedVideos || [];
 
