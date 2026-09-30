@@ -2393,6 +2393,11 @@
       log: "",
       statusText: "",
       inviteCount: 0,
+      // Run clock: wall-clock bounds of the current or last run. Persisted, not
+      // kept in memory, so a Discover or TikTok run keeps counting across the
+      // page reloads it makes. runEndedAt 0 while a run is live.
+      runStartedAt: 0,
+      runEndedAt: 0,
       savedAt: 0,
     };
   }
@@ -2794,6 +2799,9 @@
   }
 
   function saveState(state) {
+    // Every path that ends a run (finish, Stop, target, error) saves running
+    // false, so the clock is stopped here once rather than at each of them.
+    if (!state.running && state.runStartedAt && !state.runEndedAt) state.runEndedAt = Date.now();
     state.savedAt = Date.now();
     _memState = state;
 
@@ -4941,6 +4949,38 @@
     select.disabled = Boolean(running);
   }
 
+  // m:ss, or h:mm:ss once a run passes an hour.
+  function formatRunDuration(ms) {
+    const total = Math.max(Math.floor(ms / 1000), 0);
+    const hours = Math.floor(total / 3600);
+    const minutes = Math.floor((total % 3600) / 60);
+    const seconds = String(total % 60).padStart(2, "0");
+    return hours > 0 ? `${hours}:${String(minutes).padStart(2, "0")}:${seconds}` : `${minutes}:${seconds}`;
+  }
+
+  function renderRunClock(state = loadState()) {
+    const clockEl = document.getElementById("dic-run-clock");
+    if (!clockEl) return;
+    const startedAt = Number(state.runStartedAt) || 0;
+    if (!startedAt) {
+      clockEl.textContent = formatRunDuration(0);
+      return;
+    }
+    const endedAt = state.running ? Date.now() : Number(state.runEndedAt) || startedAt;
+    clockEl.textContent = formatRunDuration(endedAt - startedAt);
+  }
+
+  // Ticks the run clock between refreshUI calls, which only happen on events.
+  // Idle ticks cost one state read and leave the frozen value alone.
+  let runClockTimer = null;
+  function startRunClockTicker() {
+    if (runClockTimer) return;
+    runClockTimer = window.setInterval(() => {
+      const state = loadState();
+      if (state.running) renderRunClock(state);
+    }, 1000);
+  }
+
   function refreshUI() {
     const state = loadState();
     const mode = getCollectorMode();
@@ -5091,6 +5131,7 @@
         tab === "creators" ? creators.length : (state.inviteUrls || []).length
       }`;
     }
+    renderRunClock(state);
     if (discoverCardEl) {
       const discoverCardIndex = state.running && mode === "discover" ? Number(state.discoverCardCursor) || 0 : 0;
       discoverCardEl.style.display = mode === "discover" ? "" : "none";
@@ -5237,6 +5278,9 @@
     if (SITE !== "discord" || getActiveTab() === "creators") {
       state.running = false;
       state.statusText = "";
+      // The run died with the tab; its last save is when it last did anything,
+      // so stop the clock there rather than counting the time the tab was shut.
+      if (state.runStartedAt && !state.runEndedAt) state.runEndedAt = Number(state.savedAt) || Date.now();
       saveState(state);
     }
   }
@@ -5968,6 +6012,10 @@
               <span class="dic-stat-label">Collected</span>
               <span class="dic-stat-value" id="dic-count">0</span>
             </div>
+            <div class="dic-stat">
+              <span class="dic-stat-label">Time</span>
+              <span class="dic-stat-value" id="dic-run-clock">0:00</span>
+            </div>
           </div>
         </div>
         <div id="dic-log-card">
@@ -6322,6 +6370,8 @@
         }
         const creatorState = loadState();
         creatorState.running = true;
+        creatorState.runStartedAt = Date.now();
+        creatorState.runEndedAt = 0;
         creatorState.log = "";
         creatorState.statusText = `${platform.label} sweep running...`;
         saveState(creatorState);
@@ -6348,6 +6398,8 @@
       const state = loadState();
       const mode = getCollectorMode();
       state.running = true;
+      state.runStartedAt = Date.now();
+      state.runEndedAt = 0;
       state.log = "";
       state.inviteUrls = [];
       state.serverIndex = 0;
@@ -6439,6 +6491,7 @@
 
   clearStaleRunningFlag();
   createUI();
+  startRunClockTicker();
 
   if (SITE === "tiktok") {
     ttResumeSweepIfNeeded().catch((err) => {
