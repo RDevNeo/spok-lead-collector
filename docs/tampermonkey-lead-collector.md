@@ -1,6 +1,6 @@
 # Tampermonkey Lead Collector
 
-This doc describes `lead-collector.user.js`, the Tampermonkey userscript used on Discord web, YouTube and TikTok.
+This doc describes `lead-collector.user.js`, the Tampermonkey userscript used on Discord web, YouTube, TikTok and Instagram.
 
 ## What it is
 

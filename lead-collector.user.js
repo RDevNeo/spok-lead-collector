@@ -2,7 +2,7 @@
 // @name         Lead Collector
 // @namespace    https://github.com/RDevNeo/lead-collector
 // @version      1.10.37
-// @description  Collect Discord server invites, and YouTube and TikTok creator profiles, into SpokPayCRM.
+// @description  Collect Discord server invites, and YouTube, TikTok and Instagram creator profiles, into SpokPayCRM.
 // @author       RDevNeo
 // @license      MIT
 // @homepageURL  https://github.com/RDevNeo/spok-lead-collector
@@ -12,6 +12,8 @@
 // @match        https://www.youtube.com/*
 // @match        https://m.youtube.com/*
 // @match        https://www.tiktok.com/*
+// @match        https://www.instagram.com/*
+// @match        https://instagram.com/*
 // @grant        none
 // @updateURL    https://raw.githubusercontent.com/RDevNeo/spok-lead-collector/main/lead-collector.user.js
 // @downloadURL  https://raw.githubusercontent.com/RDevNeo/spok-lead-collector/main/lead-collector.user.js
@@ -85,21 +87,24 @@
   // ===========================================================================
   // Site detection
   //
-  // The panel runs on three sites. Server collection drives the Discord DOM and
-  // is meaningless elsewhere; creator collection reads YouTube's or TikTok's own
-  // data and is meaningless on Discord. So the tab matching the current site is
-  // the one that can actually run, and the other explains where to go.
+  // The panel runs on four sites. Server collection drives the Discord DOM and
+  // is meaningless elsewhere; creator collection reads YouTube's, TikTok's or
+  // Instagram's own data and is meaningless on Discord. So the tab matching the
+  // current site is the one that can actually run, and the other explains where
+  // to go.
   // ===========================================================================
   const SITE = /(^|\.)youtube\.com$/i.test(location.hostname)
     ? "youtube"
     : /(^|\.)tiktok\.com$/i.test(location.hostname)
       ? "tiktok"
-      : "discord";
+      : /(^|\.)instagram\.com$/i.test(location.hostname)
+        ? "instagram"
+        : "discord";
 
-  // Creator platforms the Creators tab can be pointed at. YouTube and TikTok have
-  // collectors behind them; the others are listed as unavailable so the
-  // dropdown shows where this is going without pretending they work — they are
-  // rendered disabled and cannot be selected.
+  // Creator platforms the Creators tab can be pointed at. Each one listed here
+  // as `available` has a collector behind it; anything added later without one
+  // is listed unavailable so the dropdown shows where this is going without
+  // pretending it works — it is rendered disabled and cannot be selected.
   //
   // The ORDER is prospecting priority, not implementation status, and is
   // deliberately not "the working one first". SpokPay sells to lojistas moving
@@ -119,7 +124,7 @@
       label: "Instagram",
       site: "instagram",
       host: "instagram.com",
-      available: false,
+      available: true,
     },
     { value: "tiktok", label: "TikTok", site: "tiktok", host: "tiktok.com", available: true },
     { value: "youtube", label: "YouTube", site: "youtube", host: "youtube.com", available: true },
@@ -2322,6 +2327,998 @@
     if (!state.running || !state.ttSweep) return;
     stopRequested = false;
     const outcome = await ttContinueSweep();
+    if (outcome === "done") finishCreatorRun();
+  }
+
+  // --- Instagram creator collection ------------------------------------------
+  //
+  // Instagram splits into two surfaces that behave nothing alike, and the split
+  // is what shapes everything below.
+  //
+  //   • DISCOVERY answers a plain same-origin fetch. `/api/v1/tags/web_info/`
+  //     and `/api/v1/tags/<tag>/sections/` return a hashtag's media — each post
+  //     carrying its author AND its post time — and
+  //     `/api/v1/web/search/topsearch/` returns accounts matching the term. All
+  //     three need the `X-IG-App-ID` header the web app sends, and all three
+  //     need the operator signed in.
+  //
+  //   • A PROFILE does not. Instagram embeds none of a profile's data in the
+  //     HTML it serves — the page fetches it by GraphQL after load, with a
+  //     `doc_id` that changes on every Instagram deploy — and the one REST
+  //     endpoint that used to answer it, `/api/v1/users/web_profile_info/`,
+  //     refuses with HTTP 429 even for a healthy signed-in session. So a
+  //     profile is read the way the TikTok sweep reads one: by VISITING it in
+  //     the operator's tab and reading what the page renders. That needs no
+  //     rotating query id and no forged signature, and it survives Instagram
+  //     changing its API — the page is the contract.
+  //
+  // A visit reloads the page and this script with it, so the sweep lives in
+  // saved state (`igSweep`) and resumes on every load: read the profile the tab
+  // was sent to, then open the next queued account, or run the next discovery
+  // pass once the queue is empty. Same machine as the TikTok sweep.
+
+  const IG_ORIGIN = "https://www.instagram.com";
+
+  // The web app's own API id, read from the page it is embedded in and falling
+  // back to the value Instagram has shipped for years. Cached: the document it
+  // is read from is ~400KB.
+  const IG_APP_ID_FALLBACK = "936619743392459";
+  let _igAppId = null;
+
+  function igAppId() {
+    if (_igAppId) return _igAppId;
+    let found = null;
+    try {
+      found = (document.documentElement.innerHTML.match(/"X-IG-App-ID"\s*:\s*"(\d+)"/) || [])[1];
+    } catch {
+      found = null;
+    }
+    _igAppId = found || IG_APP_ID_FALLBACK;
+    return _igAppId;
+  }
+
+  // Instagram rate-limits harder than either other platform, so discovery is
+  // paced more slowly than its TikTok equivalent.
+  const IG_PAGE_DELAY_MS = 1500;
+  const IG_RETRY_DELAY_MS = 10000;
+  const IG_FETCH_TIMEOUT_MS = 15000;
+  // Pause before sending the tab to the next profile.
+  const IG_VISIT_DELAY_MS = 1200;
+
+  // Safety stop only, like YT_MAX_PAGES.
+  const IG_MAX_PAGES = 40;
+  const IG_DRY_PAGE_LIMIT = 3;
+
+  // Captions travel into the CRM, so they are bounded — same reason as
+  // TT_TITLE_MAX.
+  const IG_TITLE_MAX = 300;
+
+  // How long a visited profile has to render before the account is given up,
+  // and how long its grid gets to appear after the header does.
+  const IG_VISIT_TIMEOUT_MS = 25000;
+  const IG_GRID_WAIT_MS = 9000;
+  // A saved sweep older than this is abandoned rather than resumed: the tab was
+  // closed or left, and picking it up later would surprise the operator.
+  const IG_SWEEP_STALE_MS = 10 * 60 * 1000;
+
+  function igCsrfToken() {
+    return (document.cookie.match(/csrftoken=([^;]+)/) || [])[1] || "";
+  }
+
+  // GET or POST one Instagram discovery endpoint.
+  //
+  // Instagram has three ways of saying "not for you", and all mean the same
+  // thing to a sweep — every further call fails the same way until the operator
+  // acts — so all three are flagged `igRefused`: 401/403 (the login wall, which
+  // is also what a signed-out call gets), 429 (rate-limited), and an HTML body
+  // where JSON was asked for, which is the login wall again under a 200.
+  async function igFetch(path, params, init) {
+    const query = new URLSearchParams();
+    for (const [key, value] of Object.entries(params || {})) {
+      if (value === undefined || value === null || value === "") continue;
+      query.set(key, String(value));
+    }
+    const suffix = [...query.keys()].length ? `?${query}` : "";
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), IG_FETCH_TIMEOUT_MS);
+    let res;
+    try {
+      res = await fetch(`${IG_ORIGIN}${path}${suffix}`, {
+        credentials: "include",
+        signal: controller.signal,
+        ...(init || {}),
+        headers: {
+          "X-IG-App-ID": igAppId(),
+          "X-Requested-With": "XMLHttpRequest",
+          // Instagram rejects a POST whose CSRF token does not match the cookie
+          // it set. Harmless on a GET, so it is sent on both.
+          "X-CSRFToken": igCsrfToken(),
+          ...((init && init.headers) || {}),
+        },
+      });
+    } catch (err) {
+      if (err && err.name === "AbortError") throw new Error("timed out");
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
+
+    const text = await res.text();
+    if (res.status === 401 || res.status === 403 || res.status === 429) {
+      const err = new Error(
+        res.status === 429
+          ? "Instagram is rate-limiting this session"
+          : "Instagram would not serve the request - sign in on instagram.com",
+      );
+      err.igRefused = true;
+      throw err;
+    }
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    try {
+      return JSON.parse(text);
+    } catch {
+      const err = new Error("Instagram answered with a page instead of data");
+      err.igRefused = true;
+      throw err;
+    }
+  }
+
+  // An Instagram post's shortcode carries its creation time. The code is
+  // base64 of the media's 64-bit id, whose high bits are a millisecond offset
+  // from Instagram's own epoch — so a post LINK, which is all a rendered grid
+  // gives, becomes an absolute date with no request and no localized "2d ago"
+  // to parse. Same trick, and same payoff, as ttTimeFromItemId.
+  //
+  // Only the FIRST 11 characters are read. Instagram also issues longer codes
+  // (39 characters in live use), and those carry the same id in their first 11
+  // with the rest appended; decoding the whole string yields a number far
+  // outside any real date. Checked against the posts' own `<time datetime>`:
+  // an 11-character code and a 39-character one each decoded to within a
+  // minute of what the post page reported.
+  const IG_SHORTCODE_ALPHABET =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+  const IG_PK_EPOCH_MS = 1314220021721n;
+
+  function igTimeFromShortcode(code) {
+    const text = String(code || "").slice(0, 11);
+    if (text.length < 11) return null;
+    try {
+      let value = 0n;
+      for (const character of text) {
+        const index = IG_SHORTCODE_ALPHABET.indexOf(character);
+        if (index < 0) return null;
+        value = value * 64n + BigInt(index);
+      }
+      const ms = Number((value >> 23n) + IG_PK_EPOCH_MS);
+      // Anything before Instagram issued ids this way, or in the future, is not
+      // a real code.
+      return ms > Date.UTC(2010, 0, 1) && ms < Date.now() + 86400000 ? ms : null;
+    } catch {
+      return null;
+    }
+  }
+
+  // First finite number among the candidates; null — not 0 — when nothing is
+  // there, same contract as ytParseCount and ttCount.
+  function igCount(...candidates) {
+    for (const value of candidates) {
+      if (value === undefined || value === null || value === "") continue;
+      const parsed = Number(value);
+      if (Number.isFinite(parsed)) return parsed;
+    }
+    return null;
+  }
+
+  // "blox fruits" → "bloxfruits", "#Roblox" → "roblox". Null for anything that
+  // could not be a hashtag, so the pass is skipped rather than asking Instagram
+  // for a tag that cannot exist. Same rule as ttHashtagFromQuery.
+  function igHashtagFromQuery(query) {
+    const tag = String(query || "")
+      .replace(/^#/, "")
+      .replace(/\s+/g, "")
+      .toLowerCase();
+    return /^[\p{L}\p{N}_]+$/u.test(tag) ? tag : null;
+  }
+
+  // One sighting of an account in discovery. Search results and media authors
+  // describe an account the same way, so both arrive here.
+  function igUserSighting(info) {
+    if (!info || typeof info !== "object") return null;
+    const username = String(info.username || "").trim();
+    const id = String(info.pk || info.pk_id || info.id || "");
+    if (!username || !id) return null;
+    return {
+      id,
+      username,
+      name: info.full_name || null,
+      avatarUrl: info.profile_pic_url || null,
+      followers: igCount(info.follower_count),
+      latestPostAt: null,
+    };
+  }
+
+  // A post's author, dated by the post. That date is a FLOOR on the account's
+  // activity, never a verdict: a hashtag's "top" section shows posts that did
+  // well, not recent ones, so an old sighting proves nothing about an account
+  // posting daily. It is folded in with Math.max alongside what the profile
+  // itself shows, exactly as the TikTok sweep treats a discovery date.
+  function igMediaSighting(media) {
+    const sighting = igUserSighting(media && media.user);
+    if (!sighting) return null;
+    const taken = Number(media.taken_at);
+    sighting.latestPostAt = Number.isFinite(taken) && taken > 0 ? taken * 1000 : null;
+    return sighting;
+  }
+
+  function igSightingsFromTopSearch(data) {
+    return ((data && data.users) || [])
+      .map((row) => igUserSighting(row && row.user))
+      .filter(Boolean);
+  }
+
+  // Hashtag pages arrange their media in several layouts — `medias`,
+  // `fill_items`, a clips carousel — and Instagram changes which it sends.
+  // Rather than walk those layouts by name, collect every media object in the
+  // payload: one with an author and a post time. That survives a layout
+  // Instagram has not shipped yet, and is the same reasoning as ytCollect.
+  function igCollectMedia(node, out = [], seen = new Set()) {
+    if (!node || typeof node !== "object" || seen.has(node)) return out;
+    seen.add(node);
+    if (Array.isArray(node)) {
+      for (const item of node) igCollectMedia(item, out, seen);
+      return out;
+    }
+    if (node.taken_at && node.user && typeof node.user === "object" && node.user.username) {
+      out.push(node);
+    }
+    for (const value of Object.values(node)) {
+      if (value && typeof value === "object") igCollectMedia(value, out, seen);
+    }
+    return out;
+  }
+
+  // Page two onward of a hashtag — a POST, which is what the web app sends when
+  // the page is scrolled. `max_id` is omitted on the first call so Instagram
+  // starts the tab from its newest.
+  async function igFetchTagSection(tag, maxId) {
+    const body = new URLSearchParams({ tab: "recent", page: "0" });
+    if (maxId) body.set("max_id", String(maxId));
+    const data = await igFetch(`/api/v1/tags/${encodeURIComponent(tag)}/sections/`, null, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: body.toString(),
+    });
+    return {
+      sightings: igCollectMedia(data.sections || []).map(igMediaSighting).filter(Boolean),
+      cursor: data.more_available ? data.next_max_id || null : null,
+    };
+  }
+
+  // Marks the hashtag pass's switch from the one-shot `web_info` page to the
+  // paged `recent` tab. Not a real cursor, so it can never collide with one.
+  const IG_TAG_RECENT_START = "recent:start";
+
+  // Discovery passes, run in order until the target is met. Each returns a
+  // different set, the same reasoning as YT_DISCOVERY_PASSES; `open` returns
+  // the pass's page fetcher, or null when the pass cannot apply to the term.
+  //
+  // Media comes FIRST. An account found through a post arrives with a date on
+  // it, which can only ever prove the account alive — so the gate keeps
+  // accounts whose own grid fails to render rather than dropping a live one.
+  //
+  // Every fetcher answers `{ sightings, cursor }`, a cursor of null being the
+  // end of that source. Normalizing paging here keeps igPageThrough from having
+  // to know which of Instagram's several cursor spellings each endpoint uses.
+  const IG_DISCOVERY_PASSES = [
+    {
+      label: "Hashtag",
+      via: (query) => `#${igHashtagFromQuery(query)}`,
+      open: async (query) => {
+        const tag = igHashtagFromQuery(query);
+        if (!tag) return null;
+        return async (page) => {
+          if (!page.cursor) {
+            // `web_info` carries the tag's TOP media in one read — where a
+            // term's best-performing sellers sit.
+            const data = await igFetch("/api/v1/tags/web_info/", { tag_name: tag });
+            const root = (data && data.data) || {};
+            const sections = [
+              ...((root.top || {}).sections || []),
+              ...((root.recent || {}).sections || []),
+            ];
+            return {
+              sightings: igCollectMedia(sections).map(igMediaSighting).filter(Boolean),
+              cursor: IG_TAG_RECENT_START,
+            };
+          }
+          // Then the RECENT tab, which is who is posting about the term right
+          // now. Only this tab's cursor actually advances: paging `top` answers
+          // every page with the same `next_max_id` and would loop forever.
+          return igFetchTagSection(tag, page.cursor === IG_TAG_RECENT_START ? "" : page.cursor);
+        };
+      },
+    },
+    {
+      label: "Accounts",
+      open: async (query) => async (page) => {
+        // Top search answers once, with no cursor of its own.
+        if (page.cursor) return { sightings: [], cursor: null };
+        const data = await igFetch("/api/v1/web/search/topsearch/", {
+          context: "blended",
+          query,
+          include_reel: "true",
+        });
+        return { sightings: igSightingsFromTopSearch(data), cursor: null };
+      },
+    },
+  ];
+
+  // Fold one sighting into this pass's queue. Returns true only for an account
+  // not seen before, in this sweep or in the stored collection — and a repeat
+  // still counts for something, since the same creator turns up once per post
+  // and the NEWEST date seen is the one worth keeping.
+  function igAddSighting(found, known, sighting) {
+    const handleKey = `@${sighting.username.toLowerCase()}`;
+    const key = sighting.id || handleKey;
+    const existing = found.get(key);
+    if (existing) {
+      if ((sighting.latestPostAt || 0) > (existing.latestPostAt || 0)) {
+        existing.latestPostAt = sighting.latestPostAt;
+      }
+      return false;
+    }
+    if (known.has(key) || known.has(handleKey)) return false;
+    known.add(key);
+    known.add(handleKey);
+    found.set(key, { ...sighting, key });
+    return true;
+  }
+
+  // Page through one discovery source until it runs dry, the target is met,
+  // Instagram refuses, or the operator stops. Never throws: a failure after the
+  // first page keeps what was already found, and `refused` says why it ended.
+  async function igPageThrough(label, fetchPage, known, wanted) {
+    const found = new Map();
+    const page = { cursor: null };
+    let dryPages = 0;
+    let refused = false;
+
+    for (let index = 1; index <= IG_MAX_PAGES; index += 1) {
+      if (stopRequested) break;
+
+      let result;
+      try {
+        result = await fetchPage(page);
+      } catch (err) {
+        // One paced retry, and only for something that is not a flat refusal:
+        // a refusal means the session itself is the problem, so asking again a
+        // few seconds later changes nothing but the time spent.
+        if (err && !err.igRefused && !stopRequested) {
+          await sleep(IG_RETRY_DELAY_MS);
+          result = await fetchPage(page).catch((retryErr) => {
+            err = retryErr;
+            return null;
+          });
+        }
+        if (!result) {
+          refused = Boolean(err && err.igRefused);
+          log(`${label} page ${index} failed: ${err instanceof Error ? err.message : String(err)}`);
+          break;
+        }
+      }
+
+      let fresh = 0;
+      for (const sighting of result.sightings || []) {
+        if (igAddSighting(found, known, sighting)) fresh += 1;
+      }
+
+      if (fresh === 0) {
+        dryPages += 1;
+        if (dryPages >= IG_DRY_PAGE_LIMIT) {
+          log(`${label}: no new accounts for ${dryPages} pages - source exhausted.`);
+          break;
+        }
+      } else {
+        dryPages = 0;
+        log(`${label} page ${index}: ${fresh} new account(s). ${found.size} queued.`);
+      }
+
+      if (wanted > 0 && found.size >= wanted) {
+        log(`${label}: enough accounts for the target.`);
+        break;
+      }
+      if (!result.cursor || result.cursor === page.cursor) {
+        log(`${label}: no further pages.`);
+        break;
+      }
+      page.cursor = result.cursor;
+      await sleep(IG_PAGE_DELAY_MS);
+    }
+
+    return { found: [...found.values()], refused };
+  }
+
+  // --- Reading a visited profile ---------------------------------------------
+  //
+  // Everything below reads the RENDERED page rather than any payload, because
+  // Instagram ships a profile's data in neither the HTML nor any endpoint this
+  // script may call (see the section comment above). Structural handles are
+  // preferred throughout, as everywhere else in this file: post links by their
+  // `/p/` and `/reel/` paths, bio links by Instagram's own `l.instagram.com`
+  // redirector, the exact follower count by the `title` Instagram puts beside
+  // the rounded one. The one place a visible string is unavoidable — the three
+  // header counts, which read "2,028 posts · 9.8M followers · 532 following" in
+  // whatever language the operator's session is in — is handled by POSITION
+  // rather than by matching those words: the three numbers appear in that order
+  // in every language.
+
+  function igOnProfileOf(username) {
+    const match = location.pathname.match(/^\/([^/?#]+)\/?$/);
+    return Boolean(match && decodeURIComponent(match[1]).toLowerCase() === username.toLowerCase());
+  }
+
+  // The posts the grid is showing for THIS account. A profile also links to
+  // other accounts' posts (suggested, tagged), so only links carrying this
+  // handle — or none at all — are read.
+  function igPostsOnPage(username) {
+    const handle = username.toLowerCase();
+    const found = new Map();
+    for (const anchor of document.querySelectorAll('a[href*="/p/"], a[href*="/reel/"]')) {
+      if (anchor.closest("#dic-panel")) continue;
+      const match = (anchor.getAttribute("href") || "").match(/^\/(?:([\w.]+)\/)?(p|reel)\/([\w-]+)/);
+      if (!match) continue;
+      if (match[1] && match[1].toLowerCase() !== handle) continue;
+      const image = anchor.querySelector("img");
+      const source = image ? image.getAttribute("src") || "" : "";
+      found.set(match[3], {
+        code: match[3],
+        // A reel is Instagram's video post, and the path says so without any
+        // label being read. A video published as an ordinary feed post is only
+        // marked by a localized icon label, so it is left out rather than
+        // guessed at.
+        isReel: match[2] === "reel",
+        title: igPostTitle(image && image.getAttribute("alt")),
+        thumbnailUrl: source.startsWith("http") ? source : null,
+        at: igTimeFromShortcode(match[3]),
+      });
+    }
+    return [...found.values()];
+  }
+
+  // Instagram writes a grid image's alt text as the post's caption, which is
+  // the part worth keeping. Whitespace is normalized and the length bounded,
+  // since this travels into the CRM.
+  function igPostTitle(alt) {
+    const text = String(alt || "").replace(/\s+/g, " ").trim();
+    return text ? text.slice(0, IG_TITLE_MAX) : null;
+  }
+
+  // Instagram stamps a per-click `fbclid` onto every outbound profile link on
+  // its way through the redirector. It is Facebook's tracking id, not part of
+  // the creator's link, and storing it hands the CRM a different URL for the
+  // same destination on every sweep — so it comes off. Anything the creator put
+  // there themselves is left alone.
+  function igCleanLink(raw) {
+    const value = String(raw || "").trim();
+    if (!value) return null;
+    try {
+      const url = new URL(value);
+      url.searchParams.delete("fbclid");
+      // `toString` re-adds a trailing "?" when the last parameter goes.
+      return url.toString().replace(/\?$/, "");
+    } catch {
+      return value;
+    }
+  }
+
+  // Whether a run of text is one of a profile page's counts rather than prose —
+  // "2,028 posts", "9.8M followers", "532 seguidores". A profile page carries
+  // several of these: the account's own, and a trio for each account Instagram
+  // suggests beside it, every one rendered in the same kind of span as the bio.
+  //
+  // Matched on SHAPE, not on those words, which are localized: a number, then
+  // one or two words, and nothing else. Prose that happens to open with a
+  // number ("2 anos vendendo robux") runs longer than that and is kept.
+  const IG_COUNT_LABEL = /^\d[\d.,]*\s*[KkMmBb]?(?:\s+\p{L}+){1,2}$/u;
+
+  // Every number a profile header writes: "2,028", "9.8M", "1.234".
+  //
+  // It must START with a digit. An earlier `[\d.,]+` also matched a bare ".",
+  // so a bio reading "Sup." counted as three numbers and that element was taken
+  // for the header — which left the account's real counts unread.
+  function igCountTokens(text) {
+    return String(text || "").match(/\b\d[\d.,]*\s*[KkMmBb]?\b/g) || [];
+  }
+
+  // The smallest element holding this profile's header: it names the account
+  // and carries its three counts. Found by shape rather than by class, since
+  // Instagram's class names are generated and change between deploys.
+  function igHeaderElement(username) {
+    const handle = username.toLowerCase();
+    let best = null;
+    for (const section of document.querySelectorAll("section, main")) {
+      const text = section.innerText || "";
+      if (!text.toLowerCase().includes(handle)) continue;
+      if (igCountTokens(text).length < 3) continue;
+      if (!best || text.length < (best.innerText || "").length) best = section;
+    }
+    return best;
+  }
+
+  // The profile the tab is rendering, or null while it has not rendered yet.
+  function igProfileOnPage(username) {
+    const header = igHeaderElement(username);
+    if (!header) return null;
+    const headerText = header.innerText || "";
+
+    // Posts, followers, following — in that order, in every language.
+    const counts = igCountTokens(headerText)
+      .map((token) => ytParseCount(token))
+      .filter((value) => value !== null);
+
+    // Instagram abbreviates a large count in the text ("9.8M") and carries the
+    // exact figure in a `title` beside it, so the follower count is read
+    // EXACTLY rather than from the rounded text. Small accounts show their
+    // count in full and carry no title, which is what the positional fallback
+    // is for.
+    let exact = null;
+    for (const element of header.querySelectorAll("[title]")) {
+      const title = (element.getAttribute("title") || "").trim();
+      if (!/^\d[\d.,]*$/.test(title)) continue;
+      const value = ytParseCount(title);
+      if (value !== null) exact = exact === null ? value : Math.max(exact, value);
+    }
+
+    const posts = igPostsOnPage(username);
+    const firstPost = document.querySelector('a[href*="/p/"], a[href*="/reel/"]');
+
+    // The display name, which Instagram shows directly under the handle.
+    const lines = headerText.split("\n").map((line) => line.trim()).filter(Boolean);
+    let name = null;
+    for (const line of lines) {
+      if (line.toLowerCase() === username.toLowerCase()) continue;
+      if (igCountTokens(line).length) break;
+      name = line.slice(0, 120);
+      break;
+    }
+
+    // The bio: the longest free-text run above the grid that is neither the
+    // handle, the display name, nor one of the counts.
+    //
+    // A profile page carries SEVERAL count blocks — this account's, and one for
+    // each account Instagram suggests alongside it — and renders every count in
+    // the same kind of span as the bio. So a candidate that reads like a count
+    // is rejected (IG_COUNT_LABEL); without that, an account with no bio of its
+    // own ends up storing a neighbour's "81 posts".
+    //
+    // The scan is scoped two levels up from the counts. The bio sits beside the
+    // header block rather than inside it, so the counts' own element is too
+    // tight — and the whole document is too wide: where an account is private,
+    // Instagram puts its own "Follow to see their photos and videos" where the
+    // grid would be, and a document-wide scan stores that as if it were the
+    // account's own words. Two levels up reaches the real bio in both cases,
+    // private accounts included.
+    const bioScope =
+      (header.parentElement && header.parentElement.parentElement) ||
+      header.parentElement ||
+      header;
+
+    let description = null;
+    for (const span of bioScope.querySelectorAll('span[dir="auto"], h1[dir="auto"]')) {
+      if (span.closest("a[href]")) continue;
+      if (
+        firstPost &&
+        span.compareDocumentPosition(firstPost) & Node.DOCUMENT_POSITION_PRECEDING
+      ) {
+        continue;
+      }
+      const text = (span.innerText || "").trim();
+      if (!text || text.length > 1000) continue;
+      if (text.toLowerCase() === username.toLowerCase() || text === name) continue;
+      if (IG_COUNT_LABEL.test(text)) continue;
+      if (!description || text.length > description.length) description = text;
+    }
+
+    // Bio links. Instagram routes every outbound profile link through its own
+    // `l.instagram.com` redirector with the destination in `?u=`, which is both
+    // a reliable structural handle AND the real URL, so the operator's click
+    // does not have to travel through the redirector.
+    const links = [];
+    for (const anchor of document.querySelectorAll('a[href*="l.instagram.com"]')) {
+      try {
+        const url = igCleanLink(
+          new URL(anchor.getAttribute("href") || "", location.origin).searchParams.get("u"),
+        );
+        if (!url || links.some((link) => link.url === url)) continue;
+        links.push({ label: anchor.textContent.trim().slice(0, 80) || null, url });
+      } catch {
+        /* a link whose target will not parse is not a link worth storing */
+      }
+    }
+
+    return {
+      username,
+      name,
+      description: description ? description.replace(/\s+/g, " ").slice(0, 1000) : null,
+      followers: exact !== null ? exact : counts.length > 1 ? counts[1] : null,
+      posts: counts.length ? counts[0] : null,
+      links,
+      uploads: igNewestUploads(username, posts),
+    };
+  }
+
+  // The newest post time plus the podium — the same `{ newest, videos }`
+  // contract as ytFetchRecentUploads and ttNewestUploads.
+  //
+  // The two read DIFFERENT sets on purpose. `newest` is the newest post of ANY
+  // kind, because an account posting photos daily is plainly alive and the
+  // freshness gate's question is only whether the account is still being
+  // worked. The podium is reels: they are Instagram's video post, and the field
+  // they fill is `recent_videos`.
+  function igNewestUploads(username, posts) {
+    let newest = 0;
+    for (const post of posts) {
+      if (post.at && post.at > newest) newest = post.at;
+    }
+    const videos = posts
+      .filter((post) => post.isReel && post.at)
+      .sort((left, right) => right.at - left.at)
+      .slice(0, YT_RECENT_VIDEO_LIMIT)
+      .map((post) => ({
+        video_id: post.code,
+        title: post.title,
+        url: `${IG_ORIGIN}/${username}/reel/${post.code}/`,
+        thumbnail_url: post.thumbnailUrl,
+        published_at: new Date(post.at).toISOString(),
+        // Instagram shows no view count in a profile grid — it is revealed only
+        // on the post itself — so this stays null rather than being invented.
+        view_count: null,
+      }));
+    return { newest: newest > 0 ? newest : null, videos };
+  }
+
+  // Read the profile the tab was sent to, giving the page time to render.
+  // Instagram fetches a profile after load, so the header appears a beat after
+  // the document is ready and the grid a beat after that.
+  async function igReadVisitedProfile(entry) {
+    const profile = await waitFor(
+      () => igProfileOnPage(entry.username),
+      IG_VISIT_TIMEOUT_MS,
+      400,
+    );
+    if (!profile) throw new Error("the profile did not render");
+
+    // The grid fills after the header, so a profile read the moment its counts
+    // appear has no posts yet - which would date every account as unknown.
+    // Wait for it, bounded: an account whose grid never loads still has a
+    // profile worth keeping.
+    if ((!profile.uploads.newest && profile.posts !== 0) || profile.followers === null) {
+      const filled = await waitFor(
+        () => {
+          const again = igProfileOnPage(entry.username);
+          if (!again) return null;
+          const grid = again.uploads.newest || again.posts === 0;
+          return grid && again.followers !== null ? again : null;
+        },
+        IG_GRID_WAIT_MS,
+        400,
+      );
+      if (filled) return filled;
+      // Bounded on purpose: an account whose grid or counts never finish
+      // rendering still has a profile worth keeping, and the gate below says
+      // plainly what could not be checked. The later read still wins.
+      return igProfileOnPage(entry.username) || profile;
+    }
+    return profile;
+  }
+
+  // --- Instagram sweep -------------------------------------------------------
+  //
+  // Same machine as the TikTok sweep, and for the same reason: every account is
+  // read by visiting its profile, a visit reloads this script, so the sweep
+  // lives in saved state and is picked back up on each load.
+
+  function igLoadSweep() {
+    return loadState().igSweep || null;
+  }
+
+  // Never writes after a Stop: the sweep in memory must not resurrect itself.
+  function igSaveSweep(sweep) {
+    const state = loadState();
+    if (!state.running) return;
+    sweep.updatedAt = Date.now();
+    state.igSweep = sweep;
+    saveState(state);
+  }
+
+  function igClearSweep() {
+    const state = loadState();
+    state.igSweep = null;
+    saveState(state);
+  }
+
+  // Gate and store the account whose profile the tab is on. Returns "retry"
+  // when the page did not give up enough to decide and the account is worth
+  // opening once more, "done" when it has been settled either way.
+  async function igHarvestVisited(entry, sweep, known) {
+    const label = `@${entry.username}`;
+    const { gapDays, stats } = sweep;
+
+    let profile;
+    try {
+      profile = await igReadVisitedProfile(entry);
+    } catch (err) {
+      // A page that would not render is not an answer about the account, so it
+      // is opened once more before the sweep gives up on it.
+      if (!entry.reread) {
+        entry.reread = true;
+        log(`RETRY ${label}: ${err instanceof Error ? err.message : String(err)} - opening it again.`);
+        return "retry";
+      }
+      stats.unread += 1;
+      log(`SKIP ${label}: ${err instanceof Error ? err.message : String(err)}`);
+      return "done";
+    }
+
+    const { uploads } = profile;
+    let uploadAgeDays = null;
+    if (gapDays > 0) {
+      // The sighting date is a floor, never a verdict - see igMediaSighting.
+      const newest = Math.max(entry.latestPostAt || 0, uploads.newest || 0) || null;
+      if (!newest) {
+        if (profile.posts === 0) {
+          stats.dropped += 1;
+          log(`DROP ${label}: no posts at all.`);
+          return "done";
+        }
+        if (!entry.reread) {
+          entry.reread = true;
+          log(`RETRY ${label}: no posts showed on the profile - opening it again.`);
+          return "retry";
+        }
+        // Said plainly rather than guessed at: a private account and a grid
+        // Instagram would not render look identical from outside, and neither
+        // is evidence the account is dead.
+        stats.unread += 1;
+        log(
+          `SKIP ${label}: its posts are not visible - the account is private, or the ` +
+            "grid would not load. Not counted as dead.",
+        );
+        return "done";
+      }
+      uploadAgeDays = daysSince(newest);
+      if (uploadAgeDays > gapDays) {
+        stats.dropped += 1;
+        log(
+          `DROP ${label}: dead - last post ${formatUploadAge(uploadAgeDays)} ` +
+            `(limit ${gapDays} days).`,
+        );
+        return "done";
+      }
+    }
+
+    const record = {
+      platform: "instagram",
+      platform_id: entry.id,
+      // Instagram's own search gave the display name; the rendered header is
+      // the fallback, since what it shows sits among buttons and icon labels.
+      name: entry.name || profile.name || entry.username,
+      handle: `@${entry.username}`,
+      profile_url: `${IG_ORIGIN}/${entry.username}/`,
+      avatar_url: entry.avatarUrl,
+      subscriber_count: profile.followers ?? entry.followers ?? null,
+      // Instagram counts POSTS, not videos: a profile mixes reels and photos
+      // and publishes one total covering both. It travels in `video_count`
+      // because that is the field the CRM shows as the creator's output.
+      video_count: profile.posts,
+      // Instagram publishes neither a lifetime view total nor a like total on a
+      // profile, so both stay null rather than being inferred.
+      view_count: null,
+      like_count: null,
+      description: profile.description,
+      links: profile.links,
+      // Instagram publishes no country on a profile.
+      country: null,
+      discovered_via: entry.via || sweep.query,
+      captured_at: sweep.capturedAt,
+      // Omitted rather than empty when no reels were read — same reason as on
+      // YouTube and TikTok: the CRM reads an empty array as "this account has
+      // no uploads" and caches that instead of looking for itself.
+      ...(uploads.videos.length ? { recent_videos: uploads.videos } : {}),
+    };
+    const state = loadState();
+    state.creators = (state.creators || []).concat([record]);
+    saveState(state);
+    stats.kept += 1;
+    const followers = record.subscriber_count === null ? "hidden" : record.subscriber_count;
+    const freshness =
+      uploadAgeDays === null ? "" : `, last post ${formatUploadAge(uploadAgeDays)}`;
+    log(`OK ${record.name} - ${followers} followers, ${record.links.length} link(s)${freshness}`);
+    refreshUI();
+    return "done";
+  }
+
+  // Drive the saved sweep as far as this page load can take it. Returns
+  // "navigating" when it has sent the tab to the next profile (the next load
+  // picks up from there) and "done" when the sweep has ended.
+  async function igContinueSweep() {
+    const sweep = igLoadSweep();
+    if (!sweep) return "done";
+    const known = new Set(sweep.known || []);
+    const persist = () => {
+      sweep.known = [...known];
+      igSaveSweep(sweep);
+    };
+
+    while (!stopRequested && loadState().running) {
+      if (sweep.target > 0 && targetReached("creators")) {
+        log(`Target of ${sweep.target} creator(s) reached.`);
+        break;
+      }
+
+      // The account the tab was sent to. One retry if the visit landed
+      // somewhere else (a redirect, or the operator clicking away).
+      if (sweep.current) {
+        const entry = sweep.current;
+        if (!igOnProfileOf(entry.username) && (entry.visits || 0) < 2) {
+          entry.visits = (entry.visits || 0) + 1;
+          persist();
+          location.assign(`${IG_ORIGIN}/${encodeURIComponent(entry.username)}/`);
+          return "navigating";
+        }
+        sweep.current = null;
+        persist();
+        if (igOnProfileOf(entry.username)) {
+          if ((await igHarvestVisited(entry, sweep, known)) === "retry") {
+            // Back to the head of the queue: it is opened again straight away.
+            sweep.queue.unshift(entry);
+          }
+        } else if (!entry.reread) {
+          entry.reread = true;
+          log(`RETRY @${entry.username}: the profile would not open - trying it again.`);
+          sweep.queue.unshift(entry);
+        } else {
+          sweep.stats.unread += 1;
+          log(`SKIP @${entry.username}: the profile would not open.`);
+        }
+        persist();
+        continue;
+      }
+
+      if (sweep.queue.length) {
+        const entry = sweep.queue.shift();
+        if (!entry.reread) sweep.stats.considered += 1;
+        entry.visits = 1;
+        sweep.current = entry;
+        persist();
+        await sleep(IG_VISIT_DELAY_MS);
+        if (stopRequested || !loadState().running) break;
+        location.assign(`${IG_ORIGIN}/${encodeURIComponent(entry.username)}/`);
+        return "navigating";
+      }
+
+      if (sweep.passIndex < IG_DISCOVERY_PASSES.length) {
+        const pass = IG_DISCOVERY_PASSES[sweep.passIndex];
+        sweep.passIndex += 1;
+        persist();
+
+        let fetchPage;
+        try {
+          fetchPage = await pass.open(sweep.query);
+        } catch (err) {
+          sweep.refused = sweep.refused || Boolean(err && err.igRefused);
+          log(`${pass.label} search failed: ${err instanceof Error ? err.message : String(err)}`);
+          persist();
+          continue;
+        }
+        if (!fetchPage) {
+          log(`${pass.label}: nothing for "${sweep.query}".`);
+          continue;
+        }
+
+        const result = await igPageThrough(
+          pass.label,
+          fetchPage,
+          known,
+          discoveryAppetite(sweep.target, sweep.stats),
+        );
+        sweep.refused = sweep.refused || result.refused;
+        sweep.stats.discovered += result.found.length;
+        if (result.found.length === 0) {
+          if (!result.refused) log(`${pass.label}: nothing new.`);
+          persist();
+          continue;
+        }
+        const via = (pass.via && pass.via(sweep.query)) || sweep.query;
+        for (const entry of result.found) entry.via = via;
+        sweep.queue.push(...result.found);
+        log(`Opening ${result.found.length} profile(s) one by one...`);
+        persist();
+        continue;
+      }
+
+      break;
+    }
+
+    igFinishSweep(sweep);
+    return "done";
+  }
+
+  function igFinishSweep(sweep) {
+    const { stats, gapDays, target, query } = sweep;
+    if (stats.dropped > 0) {
+      log(`Dropped ${stats.dropped} account(s) - no verified post in the last ${gapDays} days.`);
+    }
+    // Reported apart from the dropped ones on purpose: these were never judged,
+    // so the operator knows there is something left to retry rather than
+    // reading them as accounts Instagram showed to be dead.
+    if (stats.unread > 0) {
+      log(
+        `${stats.unread} account(s) could not be read - private, or the page would ` +
+          "not render. Run the sweep again to retry them.",
+      );
+    }
+    if (sweep.refused) {
+      log(
+        "Instagram stopped answering its search. Make sure you are signed in on " +
+          "instagram.com and that no checkpoint is waiting, then press Start again. " +
+          "If you have been sweeping back to back, give it a few minutes first.",
+      );
+    } else if (stats.discovered === 0) {
+      log("Nothing new found for that term.");
+    } else if (target > 0 && !targetReached("creators") && !stopRequested) {
+      log(
+        `Every search source is exhausted for "${query}" and the target is still ` +
+          `${Math.max(target - currentCollectedCount("creators"), 0)} short. ` +
+          "Try another search term, or widen Last upload.",
+      );
+    }
+    igClearSweep();
+  }
+
+  // Start an Instagram sweep.
+  async function igCollectCreators(query) {
+    const known = new Set();
+    for (const row of loadState().creators || []) {
+      if (row.platform_id) known.add(String(row.platform_id));
+      if (row.handle) known.add(String(row.handle).toLowerCase());
+    }
+    const sweep = {
+      query,
+      capturedAt: new Date().toISOString(),
+      target: getTargetCount("creators"),
+      gapDays: getUploadGapDays(),
+      stats: { considered: 0, kept: 0, dropped: 0, discovered: 0, unread: 0 },
+      passIndex: 0,
+      queue: [],
+      current: null,
+      known: [],
+      refused: false,
+    };
+
+    log(
+      sweep.target > 0
+        ? `Sweeping Instagram for "${query}" - target ${sweep.target} creator(s).`
+        : `Sweeping Instagram for "${query}" - no target, collecting everything.`,
+    );
+    log(
+      sweep.gapDays > 0
+        ? `Dropping any account with no post in the last ${sweep.gapDays} days.`
+        : "No freshness filter - collecting accounts whenever they last posted.",
+    );
+
+    sweep.known = [...known];
+    igSaveSweep(sweep);
+    return igContinueSweep();
+  }
+
+  // Pick a sweep back up after a profile visit reloaded the page.
+  async function igResumeSweepIfNeeded() {
+    const state = loadState();
+    if (!state.running || !state.igSweep) return;
+    stopRequested = false;
+    const outcome = await igContinueSweep();
     if (outcome === "done") finishCreatorRun();
   }
 
@@ -5358,13 +6355,18 @@
   function clearStaleRunningFlag() {
     const state = loadState();
     if (!state.running) return;
-    // A TikTok sweep reloads the page on every profile it opens; a recent one
-    // is resumed, not cleared.
-    const sweep = state.ttSweep;
-    if (SITE === "tiktok" && sweep && Date.now() - (sweep.updatedAt || 0) < TT_SWEEP_STALE_MS) {
+    // A TikTok or Instagram sweep reloads the page on every profile it opens;
+    // a recent one is resumed, not cleared.
+    const ttSweep = state.ttSweep;
+    if (SITE === "tiktok" && ttSweep && Date.now() - (ttSweep.updatedAt || 0) < TT_SWEEP_STALE_MS) {
+      return;
+    }
+    const igSweep = state.igSweep;
+    if (SITE === "instagram" && igSweep && Date.now() - (igSweep.updatedAt || 0) < IG_SWEEP_STALE_MS) {
       return;
     }
     state.ttSweep = null;
+    state.igSweep = null;
     if (SITE !== "discord" || getActiveTab() === "creators") {
       state.running = false;
       state.statusText = "";
@@ -6469,8 +7471,10 @@
         try {
           const outcome = await (platform.value === "tiktok"
             ? ttCollectCreators(query)
-            : collectCreators(query));
-          // A TikTok sweep continues on the profile page it just opened.
+            : platform.value === "instagram"
+              ? igCollectCreators(query)
+              : collectCreators(query));
+          // A TikTok or Instagram sweep continues on the profile it just opened.
           if (outcome === "navigating") return;
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
@@ -6586,6 +7590,12 @@
   if (SITE === "tiktok") {
     ttResumeSweepIfNeeded().catch((err) => {
       logError("TikTok sweep resume failed", err);
+    });
+  }
+
+  if (SITE === "instagram") {
+    igResumeSweepIfNeeded().catch((err) => {
+      logError("Instagram sweep resume failed", err);
     });
   }
 

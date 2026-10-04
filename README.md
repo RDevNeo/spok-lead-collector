@@ -4,8 +4,8 @@ A [Tampermonkey](https://www.tampermonkey.net/) userscript that collects prospec
 session list you can copy out in one click. Two tabs:
 
 - **Servers** — scans Discord web pages for server invite URLs.
-- **Creators** — sweeps YouTube or TikTok search for creators and collects them as SpokPayCRM creator
-  records.
+- **Creators** — sweeps YouTube, TikTok or Instagram search for creators and collects them as
+  SpokPayCRM creator records.
 
 It is fully self-contained: no API key, no database, no external service. Nothing is ever sent
 anywhere — whatever it finds stays in the panel and in `localStorage` until you copy or clear it. The
@@ -18,19 +18,19 @@ CRM is fed by pasting, never by an automatic import.
    **[install the script](https://raw.githubusercontent.com/RDevNeo/spok-lead-collector/main/lead-collector.user.js)**
    — Tampermonkey recognizes the `// ==UserScript==` header and opens its install prompt. (Installing
    from this URL is what registers the auto-update source; a copy-pasted script never updates itself.)
-3. Open Discord web (`https://discord.com/*`), YouTube (`https://www.youtube.com/*`) or TikTok
-   (`https://www.tiktok.com/*`) — the collector panel is injected on load, opening on whichever tab
-   that site can run.
+3. Open Discord web (`https://discord.com/*`), YouTube (`https://www.youtube.com/*`), TikTok
+   (`https://www.tiktok.com/*`) or Instagram (`https://www.instagram.com/*`) — the collector panel is
+   injected on load, opening on whichever tab that site can run.
 
 Works on Discord **web** in any desktop browser with a userscript manager. It does not run inside the
 Discord desktop app, which has no userscript support.
 
 ## Tabs
 
-The panel opens on the tab the current site can actually run: Discord shows **Servers**, YouTube and
-TikTok show **Creators**. Selecting the other tab tells you where to go rather than offering controls
-that cannot work — server collection drives the Discord DOM, creator collection reads YouTube's or
-TikTok's own data.
+The panel opens on the tab the current site can actually run: Discord shows **Servers**, and YouTube,
+TikTok and Instagram show **Creators**. Selecting the other tab tells you where to go rather than
+offering controls that cannot work — server collection drives the Discord DOM, creator collection
+reads the selected platform's own data.
 
 ## Target
 
@@ -41,9 +41,11 @@ cap the next server scan. Leave it blank to collect everything the source gives;
 
 ## Creators
 
-**Source** picks the platform to sweep. YouTube and TikTok have collectors; the rest are listed as
-*soon* and cannot be selected. A sweep runs on the platform's own site — open youtube.com for YouTube,
-tiktok.com for TikTok (see [TikTok](#tiktok) below). Type a search term (e.g. `roblox blox fruits`) and
+**Source** picks the platform to sweep. YouTube, TikTok and Instagram each have a collector; anything
+added to the list without one is shown as *soon* and cannot be selected. A sweep runs on the
+platform's own site — open youtube.com for YouTube, tiktok.com for TikTok (see [TikTok](#tiktok)
+below), instagram.com for Instagram (see [Instagram](#instagram) below). Type a search term (e.g.
+`roblox blox fruits`) and
 press Start. The YouTube sweep searches
 across several surfaces, drops every channel that has not uploaded recently, then opens each
 survivor's About data for its stats and profile links.
@@ -169,6 +171,66 @@ An account nothing can date is dropped as `could not check uploads`.
 TikTok challenges automated traffic far more readily than YouTube, so the TikTok sweep paces itself
 slower. If a verification puzzle appears, solve it and press Start again; the log names it when it can
 see it.
+
+## Instagram
+
+Open `https://www.instagram.com`, **logged in**, and the Creators tab sweeps Instagram the same way it
+sweeps TikTok: discover accounts for the search term, open each one, drop the ones that have not
+posted inside **Last upload**, and store the rest as creator records. Copy and the JSONL format are
+the same.
+
+**Where accounts come from**, in order, each harvested before the next runs:
+
+| Pass | Source |
+| --- | --- |
+| Hashtag | The term read as a hashtag — `vendo robux` → `#vendorobux` — reading that tag's *top* posts and then paging its *recent* ones. Skipped if the term could not be a tag |
+| Accounts | Instagram's own account search for the term |
+
+Both are the web app's own `/api/v1/…` endpoints, called with the `X-IG-App-ID` header it sends. Both
+need you **signed in**: signed out, every one of them answers `401 require_login`. When Instagram
+stops answering — a `401`, a `429`, or its login page served where data was asked for — the sweep
+stops and says so rather than hammering on; wait a few minutes and press Start again.
+
+Only the *recent* tab is paged. Instagram answers every page of a hashtag's *top* tab with the same
+cursor, so following it would loop forever.
+
+**Each account is read by opening its profile in your tab**, exactly as the TikTok sweep does, and for
+a stricter reason: Instagram embeds *none* of a profile's data in the HTML it serves. The page fetches
+it after load through a GraphQL query whose id changes on every Instagram deploy, and the one REST
+endpoint that used to answer it (`/api/v1/users/web_profile_info/`) replies `429` even to a healthy
+signed-in session. So the profile is read from what the page **renders** — which needs no rotating
+query id, and survives Instagram changing its API. You will see the tab move from profile to profile;
+the sweep resumes itself after every page load. **Stop** ends it; a sweep abandoned for more than 10
+minutes (tab closed) is not resumed.
+
+**Freshness.** An Instagram shortcode carries the post's creation time: the code is base64 of the
+media's id, whose high bits are a millisecond offset from Instagram's own epoch. So the links in a
+rendered grid date every post with no extra request and no localized "2d ago" to parse — checked
+against the posts' own `<time datetime>`, the decoded dates landed within a minute. Only the first 11
+characters are read; Instagram also issues longer codes that carry the same id in their first 11. A
+post the sweep already saw in discovery also counts, but only as a *floor*: a hashtag's top posts are
+the ones that did well, not the recent ones, so an old sighting never marks an account dead.
+
+The gate counts posts of **any** kind — an account posting photos daily is plainly alive — while
+`recent_videos` carries reels only, since that is Instagram's video post and the field the CRM shows a
+view count beside.
+
+| Field | Notes |
+| --- | --- |
+| `platform_id` | The numeric account id — stable across handle changes |
+| `handle`, `profile_url` | From the handle the sweep opened |
+| `name`, `avatar_url` | From Instagram's search result for the account |
+| `subscriber_count` | Followers, **exact** — Instagram shows `9.8M` but carries `9,857,321` in a `title` beside it |
+| `video_count` | Total **posts**, reels and photos together — the one figure Instagram publishes |
+| `view_count`, `like_count` | Always `null` — Instagram publishes neither on a profile |
+| `description` | The bio — where sellers usually put their WhatsApp, PIX or Discord |
+| `links` | The bio links, unwrapped from Instagram's `l.instagram.com` redirector, with its per-click `fbclid` stripped so the same destination does not look new on every sweep |
+| `country` | Always `null` — Instagram publishes none |
+| `recent_videos` | The three newest reels: caption, URL, thumbnail and exact date. `view_count` is `null` — Instagram shows no view count in a profile grid |
+
+An account whose posts are not visible — private, or a grid that would not render — is reported as
+**could not be read**, counted apart from the dropped ones, and never counted as dead. Instagram shows
+those two cases identically from outside, so the sweep says so instead of guessing.
 
 ## Server modes
 
