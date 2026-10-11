@@ -1622,7 +1622,9 @@
         video_id: String(item.id),
         title: String(item.desc || "").trim() || null,
         url: `${TT_ORIGIN}/@${uniqueId}/video/${item.id}`,
-        thumbnail_url: item.originCoverUrl || item.coverUrl || null,
+        // The creator's chosen cover, not `originCoverUrl` — that is the
+        // video's first frame, solid black on any video opening on a fade.
+        thumbnail_url: item.coverUrl || item.originCoverUrl || null,
         published_at: time ? new Date(time).toISOString() : null,
         view_count: ttCount(item.playCount),
       });
